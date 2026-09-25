@@ -1,0 +1,72 @@
+# ==============================
+# Python & Virtual Environments (CRITICAL)
+# ==============================
+venv/
+*/venv/
+.venv/
+*/.venv/
+ai-models/venv/
+backend/venv/
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.dll
+*.so
+*.dylib
+
+# ==============================
+# Node & JavaScript Dependencies
+# ==============================
+node_modules/
+*/node_modules/
+package-lock.json
+
+# ==============================
+# Android Build Outputs & Caches
+# ==============================
+android/app/build/
+android/.gradle/
+android/build/
+android/.cxx/
+android/local.properties
+*/android/app/build/
+*/android/.gradle/
+*/android/build/
+*/android/.cxx/
+*/android/local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# ==============================
+# Metro & Expo
+# ==============================
+.expo/
+*/.expo/
+dist/
+web-build/
+
+# ==============================
+# IDEs & OS Metadata
+# ==============================
+.idea/
+*/.idea/
+.vscode/
+*/.vscode/
+*.swp
+*.iml
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Logs & Environment Variables
+# ==============================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env
+.env.*
