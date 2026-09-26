@@ -1,20 +1,59 @@
+import os
+import base64
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import models
 from database import engine, get_db
+from voice_verifier import enroll_child_voice, verify_speaker
 
-# Create the database tables
+from google import genai
+from google.genai import types
+
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="PetraKids Alert Brain")
+app = FastAPI(title="Petra Ride SafeTrack Core Engine")
+
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+gemini_client = None
+
+if GEMINI_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_KEY)
+    except Exception as e:
+        print(f"Gemini client notice: {e}")
+
+# --- SCHEMAS ---
+class LocationTelemetry(BaseModel):
+    child_id: str = "child_01"
+    latitude: float
+    longitude: float
+    speed: float | None = 0.0
 
 class DistressAlert(BaseModel):
     sound_type: str
     confidence: float
     latitude: float | None = None
     longitude: float | None = None
+    status: str | None = "DISTRESS_DETECTED"
+
+class VoicePayload(BaseModel):
+    child_id: str = "child_01"
+    audio_base64: str
+    detected_sound: str = "In-Cabin Acoustic Event"
+
+class TriageAnalysis(BaseModel):
+    is_emergency: bool
+    confidence: float
+    detected_situation: str
+    reassurance_speech_ar: str
+    reassurance_speech_en: str
+    log_summary: str
 
 # --- WEBSOCKET MANAGER ---
 class ConnectionManager:
@@ -26,22 +65,36 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            await connection.send_json(message)
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(connection)
 
 manager = ConnectionManager()
 
-# --- API ENDPOINTS ---
+# --- ROUTES ---
 @app.get("/")
 def health_check():
-    return {"status": "Alert Brain is online"}
+    return {"status": "Petra Ride SafeTrack Online"}
+
+@app.post("/api/telemetry/location")
+async def update_live_location(telemetry: LocationTelemetry):
+    await manager.broadcast({
+        "type": "LOCATION_TELEMETRY",
+        "child_id": telemetry.child_id,
+        "latitude": telemetry.latitude,
+        "longitude": telemetry.longitude,
+        "speed": telemetry.speed or 0.0
+    })
+    return {"status": "OK"}
 
 @app.post("/api/alerts")
 async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
-    # 1. Save to PostgreSQL
     db_alert = models.Alert(
         sound_type=alert.sound_type,
         confidence=alert.confidence,
@@ -51,216 +104,739 @@ async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
     db.add(db_alert)
     db.commit()
     db.refresh(db_alert)
-    
-    print(f"✅ Saved to DB: Alert ID {db_alert.id} - {db_alert.sound_type}")
-    
-    # 2. Broadcast live to the Map Dashboard
+
     await manager.broadcast({
+        "type": "INCIDENT_ALERT",
         "sound_type": db_alert.sound_type,
         "confidence": db_alert.confidence,
         "latitude": db_alert.latitude,
         "longitude": db_alert.longitude,
-        "timestamp": str(db_alert.timestamp)
+        "status": alert.status or "DISTRESS_DETECTED",
+        "timestamp": str(db_alert.timestamp),
+        "details": f"Acoustic register: {alert.sound_type}"
     })
-    
-    return {"message": "Alert saved & broadcasted successfully", "alert_id": db_alert.id}
+    return {"status": "DISPATCHED", "alert_id": db_alert.id}
 
 @app.get("/api/alerts")
 def get_all_alerts(db: Session = Depends(get_db)):
-    return db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(50).all()
+    return db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(30).all()
 
-# --- WEBSOCKET ENDPOINT ---
+@app.post("/api/voice/enroll")
+async def enroll_voice_endpoint(payload: VoicePayload):
+    audio_bytes = base64.b64decode(payload.audio_base64)
+    return enroll_child_voice(payload.child_id, audio_bytes)
+
+@app.post("/api/voice/verify")
+async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get_db)):
+    audio_bytes = base64.b64decode(payload.audio_base64)
+    verification_result = verify_speaker(payload.child_id, audio_bytes)
+
+    if not verification_result["verified"]:
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "Unauthorized Voice Intervention",
+            "confidence": verification_result.get("similarity", 0.0),
+            "status": "IMPOSTOR_BLOCKED",
+            "timestamp": "Just now",
+            "details": "Captain or third-party voice detected during child check-in confirmation."
+        })
+        return {
+            **verification_result,
+            "triage": {
+                "is_emergency": True,
+                "confidence": 1.0,
+                "detected_situation": "Third-party speaker attempted to override passenger check-in.",
+                "reassurance_speech_ar": "تم رفض التحقق، جاري التواصل مع العائلة فوراً.",
+                "reassurance_speech_en": "Verification mismatch. Contacting operations and parents.",
+                "log_summary": "Security alert: unauthorized vocal dismissal."
+            }
+        }
+
+    triage_data = None
+    if gemini_client:
+        try:
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+            triage_prompt = f"""
+            You are Petra Ride SafeTrack, evaluating passenger cabin audio in Amman, Jordan.
+            Trip event: "{payload.detected_sound}".
+            Evaluate child's spoken audio:
+            - Classify if this is a benign event (dropped bottle, door bump, confirmed safe) or genuine safety distress.
+            - Provide reassurance in conversational Jordanian Arabic.
+            """
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[audio_part, triage_prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=TriageAnalysis,
+                    temperature=0.2
+                ),
+            )
+            triage_data = response.parsed.model_dump()
+        except Exception:
+            pass
+
+    if not triage_data:
+        triage_data = {
+            "is_emergency": False,
+            "confidence": 0.92,
+            "detected_situation": "Passenger confirmed safety; voice profile validated.",
+            "reassurance_speech_ar": "الحمدلله على سلامتك يا بطل، رحلتك مستمرة بأمان.",
+            "reassurance_speech_en": "You are safe, hero. Continuing ride.",
+            "log_summary": "Biometric match passed, passenger safe."
+        }
+
+    await manager.broadcast({
+        "type": "INCIDENT_ALERT",
+        "sound_type": triage_data['detected_situation'],
+        "confidence": verification_result["similarity"],
+        "status": "CRITICAL_ESCALATION" if triage_data["is_emergency"] else "VERIFIED_SAFE",
+        "timestamp": "Just now",
+        "details": triage_data["log_summary"]
+    })
+
+    return {**verification_result, "triage": triage_data}
+
+
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text() # Keep connection alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# --- LIVE MAP DASHBOARD ---
+# --- MODERN RESPONSIVE COMMAND INTERFACE ---
 @app.get("/map", response_class=HTMLResponse)
 def render_map():
     return """
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>PetraKids Command Center</title>
+        <meta charset="UTF-8" />
+        <title>Petra Ride SafeTrack Operations</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+        
         <style>
             :root {
-                --bg-main: #0f172a;
-                --bg-sidebar: #1e293b;
-                --border-color: #334155;
-                --text-main: #f8fafc;
-                --text-muted: #94a3b8;
-                --accent-red: #ef4444;
-                --accent-green: #22c55e;
+                --bg-base: #090D14;
+                --bg-surface: #111726;
+                --bg-card: #182238;
+                --border-subtle: #232F48;
+                --text-primary: #F8FAFC;
+                --text-secondary: #94A3B8;
+                --brand-cyan: #0EA5E9;
+                --brand-cyan-glow: rgba(14, 165, 233, 0.25);
+                --status-green: #10B981;
+                --status-red: #EF4444;
+                --status-amber: #F59E0B;
             }
-            body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg-main); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
-            
-            /* Sidebar Styling */
-            #sidebar { width: 380px; background: var(--bg-sidebar); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; z-index: 1000; }
-            .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border-color); }
-            .sidebar-header h1 { font-size: 18px; margin: 0 0 4px 0; color: #fff; display: flex; align-items: center; gap: 8px; }
-            .status-indicator { font-size: 12px; color: var(--accent-green); font-weight: 500; }
-            
-            /* Stats Row */
-            .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 15px 20px; background: rgba(15, 23, 42, 0.4); border-bottom: 1px solid var(--border-color); }
-            .stat-box { background: var(--bg-main); padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); text-align: center; }
-            .stat-box .val { font-size: 18px; font-weight: bold; color: #fff; }
-            .stat-box .lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-top: 2px; }
 
-            /* Feed Section */
-            .feed-title { padding: 12px 20px 4px 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
-            #alert-feed { flex: 1; overflow-y: auto; padding: 10px 20px; display: flex; flex-direction: column; gap: 10px; }
-            
-            .alert-card { background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; transition: all 0.2s; }
-            .alert-card.breach { border-color: rgba(239, 68, 68, 0.6); background: rgba(239, 68, 68, 0.05); }
-            .alert-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-            .alert-type { font-weight: 600; font-size: 14px; }
-            .alert-badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; }
-            .badge-breach { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
-            .badge-safe { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
-            .alert-details { font-size: 12px; color: var(--text-muted); display: flex; flex-direction: column; gap: 2px; }
+            * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+            body { 
+                font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+                background: var(--bg-base);
+                color: var(--text-primary);
+                height: 100vh;
+                display: flex;
+                overflow: hidden;
+            }
 
-            /* Map Container */
-            #map { flex: 1; height: 100vh; }
+            #map { flex: 1; height: 100vh; background: #06090E; }
+
+            /* Desktop Sidebar vs Mobile Drawer */
+            #ops-panel {
+                width: 420px;
+                background: var(--bg-surface);
+                border-right: 1px solid var(--border-subtle);
+                display: flex;
+                flex-direction: column;
+                z-index: 1000;
+                box-shadow: 10px 0 30px rgba(0,0,0,0.5);
+                transition: height 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+
+            .drawer-handle-bar {
+                display: none;
+                width: 100%;
+                justify-content: center;
+                padding: 10px 0 6px 0;
+                cursor: pointer;
+            }
+
+            .drawer-pill {
+                width: 42px;
+                height: 5px;
+                background: #334155;
+                border-radius: 3px;
+            }
+
+            .panel-header {
+                padding: 18px 24px;
+                border-bottom: 1px solid var(--border-subtle);
+                background: rgba(17, 23, 38, 0.9);
+                backdrop-filter: blur(12px);
+            }
+
+            .brand-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 8px;
+            }
+
+            .brand-badge {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 16px;
+                font-weight: 800;
+                letter-spacing: -0.3px;
+                color: #FFFFFF;
+            }
+
+            .brand-icon {
+                width: 26px;
+                height: 26px;
+                background: var(--brand-cyan);
+                border-radius: 7px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #FFF;
+                font-size: 13px;
+                font-weight: 900;
+            }
+
+            .live-pill {
+                font-size: 11px;
+                font-weight: 700;
+                color: var(--status-green);
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                background: rgba(16, 185, 129, 0.1);
+                border: 1px solid rgba(16, 185, 129, 0.25);
+                padding: 4px 10px;
+                border-radius: 20px;
+            }
+
+            .live-dot {
+                width: 6px;
+                height: 6px;
+                background: var(--status-green);
+                border-radius: 50%;
+                box-shadow: 0 0 8px var(--status-green);
+            }
+
+            /* Captain Card Component */
+            .captain-badge-card {
+                background: var(--bg-card);
+                border: 1px solid var(--border-subtle);
+                border-radius: 12px;
+                padding: 10px 12px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-top: 8px;
+            }
+
+            .captain-left { display: flex; align-items: center; gap: 10px; }
+            .captain-avatar {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                background: #25334E;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: 700;
+                font-size: 12px;
+                color: var(--brand-cyan);
+                border: 1.5px solid var(--brand-cyan);
+            }
+
+            .captain-meta h4 { font-size: 12px; font-weight: 700; color: #FFF; }
+            .captain-meta p { font-size: 10px; color: var(--text-secondary); margin-top: 1px; }
+
+            .kids-certified {
+                background: rgba(14, 165, 233, 0.15);
+                color: var(--brand-cyan);
+                font-size: 9px;
+                font-weight: 800;
+                padding: 3px 7px;
+                border-radius: 6px;
+                border: 1px solid rgba(14, 165, 233, 0.3);
+            }
+
+            /* Telemetry Row */
+            .telemetry-strip {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr;
+                gap: 8px;
+                padding: 10px 24px;
+                background: rgba(15, 22, 38, 0.5);
+                border-bottom: 1px solid var(--border-subtle);
+            }
+
+            .telemetry-tile {
+                background: var(--bg-base);
+                border: 1px solid var(--border-subtle);
+                padding: 6px 8px;
+                border-radius: 8px;
+                text-align: center;
+            }
+
+            .telemetry-tile .val {
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 14px;
+                font-weight: 700;
+                color: #FFF;
+            }
+
+            .telemetry-tile .label {
+                font-size: 8px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                color: var(--text-secondary);
+                margin-top: 2px;
+            }
+
+            /* Feed Area */
+            .feed-header {
+                padding: 12px 24px 6px 24px;
+                font-size: 10px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+                color: var(--text-secondary);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+
+            #feed-container {
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 8px 24px 20px 24px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            .event-card {
+                background: var(--bg-card);
+                border: 1px solid var(--border-subtle);
+                border-radius: 12px;
+                padding: 12px;
+                transition: transform 0.2s, border-color 0.2s;
+                cursor: pointer;
+            }
+
+            .event-card:hover { transform: translateY(-1px); border-color: #384A6E; }
+
+            .event-card.escalated {
+                border-color: rgba(239, 68, 68, 0.5);
+                background: linear-gradient(180deg, rgba(239, 68, 68, 0.08) 0%, rgba(24, 34, 56, 0.8) 100%);
+            }
+
+            .event-card.safe {
+                border-color: rgba(16, 185, 129, 0.35);
+                background: linear-gradient(180deg, rgba(16, 185, 129, 0.05) 0%, rgba(24, 34, 56, 0.8) 100%);
+            }
+
+            .card-top {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 5px;
+            }
+
+            .card-title { font-size: 12px; font-weight: 700; color: #FFF; line-height: 1.4; flex: 1; padding-right: 8px; }
+
+            .badge {
+                font-size: 8px;
+                font-weight: 800;
+                text-transform: uppercase;
+                padding: 2px 6px;
+                border-radius: 5px;
+                white-space: nowrap;
+            }
+
+            .badge-safe { background: rgba(16, 185, 129, 0.15); color: var(--status-green); border: 1px solid rgba(16, 185, 129, 0.3); }
+            .badge-breach { background: rgba(239, 68, 68, 0.15); color: var(--status-red); border: 1px solid rgba(239, 68, 68, 0.4); }
+
+            .card-body { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
+            .card-footer {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: 8px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 9px;
+                color: #64748B;
+            }
+
+            /* Responsive Mobile Layout Fix */
+            @media (max-width: 768px) {
+                body { 
+                    flex-direction: column-reverse; 
+                    height: 100vh;
+                    overflow: hidden;
+                }
+
+                .drawer-handle-bar { display: flex; }
+
+                #ops-panel {
+                    width: 100%;
+                    height: 60vh;
+                    border-right: none;
+                    border-top: 1px solid var(--border-subtle);
+                    border-radius: 22px 22px 0 0;
+                }
+
+                #ops-panel.collapsed {
+                    height: 26vh;
+                }
+
+                #map { 
+                    flex: 1; 
+                    height: auto; 
+                }
+
+                .panel-header { padding: 10px 18px 12px 18px; }
+                .captain-badge-card { padding: 8px 10px; margin-top: 6px; }
+                .telemetry-strip { padding: 6px 18px; }
+                .feed-header { padding: 8px 18px 4px 18px; }
+                #feed-container { padding: 6px 18px 24px 18px; }
+            }
+
+            /* Vehicle Pulsing Avatar */
+            .pulse-ring {
+                position: absolute;
+                width: 38px;
+                height: 38px;
+                border-radius: 50%;
+                background: rgba(14, 165, 233, 0.3);
+                animation: car-radiate 2.2s infinite ease-out;
+            }
+            .pulse-core {
+                width: 20px;
+                height: 20px;
+                background: #0EA5E9;
+                border: 2.5px solid #FFFFFF;
+                border-radius: 50%;
+                box-shadow: 0 0 16px rgba(14, 165, 233, 0.9);
+                position: relative;
+                z-index: 2;
+            }
+            @keyframes car-radiate {
+                0% { transform: scale(0.6); opacity: 1; }
+                100% { transform: scale(1.7); opacity: 0; }
+            }
         </style>
     </head>
     <body>
-        <div id="sidebar">
-            <div class="sidebar-header">
-                <h1>🛡️ PetraKids Command</h1>
-                <div id="connection-status" class="status-indicator">Connecting to Neural Stream...</div>
+        <aside id="ops-panel">
+            <div class="drawer-handle-bar" onclick="toggleMobileDrawer()">
+                <div class="drawer-pill"></div>
             </div>
-            
-            <div class="stats-grid">
-                <div class="stat-box">
-                    <div id="total-alerts" class="val">0</div>
-                    <div class="lbl">Total Alerts</div>
+
+            <div class="panel-header">
+                <div class="brand-row">
+                    <div class="brand-badge">
+                        <div class="brand-icon">P</div>
+                        <span>SafeTrack Operations</span>
+                    </div>
+                    <div id="conn-pill" class="live-pill">
+                        <span class="live-dot"></span>
+                        <span id="conn-status">Link Active</span>
+                    </div>
                 </div>
-                <div class="stat-box">
-                    <div id="total-breaches" class="val" style="color: var(--accent-red);">0</div>
-                    <div class="lbl">Safe Breaches</div>
+
+                <div class="captain-badge-card">
+                    <div class="captain-left">
+                        <div class="captain-avatar">AZ</div>
+                        <div class="captain-meta">
+                            <h4>Ahmad Al-Zoubi • Kia Niro</h4>
+                            <p>Trip PR-9942 • Plate 24-81923</p>
+                        </div>
+                    </div>
+                    <span class="kids-certified">★ KIDS VERIFIED</span>
                 </div>
             </div>
 
-            <div class="feed-title">Live Telemetry Feed</div>
-            <div id="alert-feed">
-                <div style="color: var(--text-muted); font-size: 13px; text-align: center; margin-top: 40px;">
-                    Waiting for device telemetry...
+            <div class="telemetry-strip">
+                <div class="telemetry-tile">
+                    <div id="stat-speed" class="val">0 km/h</div>
+                    <div class="label">Speed</div>
+                </div>
+                <div class="telemetry-tile">
+                    <div id="stat-alerts" class="val">0</div>
+                    <div class="label">Events</div>
+                </div>
+                <div class="telemetry-tile">
+                    <div id="stat-breaches" class="val" style="color: var(--status-red);">0</div>
+                    <div class="label">Priority</div>
                 </div>
             </div>
-        </div>
 
-        <div id="map"></div>
+            <div class="feed-header">
+                <span>In-Cabin Audio Telemetry</span>
+                <span style="font-family: 'JetBrains Mono', monospace; font-size: 9px;">AMMAN - JORDAN</span>
+            </div>
+
+            <div id="feed-container">
+                <div style="text-align: center; color: #475569; font-size: 12px; margin-top: 24px;">
+                    Monitoring active vehicle corridor...
+                </div>
+            </div>
+        </aside>
+
+        <main id="map"></main>
 
         <script>
-            var map = L.map('map', { zoomControl: false }).setView([31.9702, 35.8354], 14);
+            const map = L.map('map', { zoomControl: false }).setView([31.9539, 35.9106], 15);
             L.control.zoom({ position: 'bottomright' }).addTo(map);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                maxZoom: 19,
-                attribution: '© OpenStreetMap'
-            }).addTo(map);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 
-            var safeZoneCircle = null;
             let alertCount = 0;
             let breachCount = 0;
+            let centered = false;
 
-            // 1. Render Safe Zone perimeter
-            fetch('/api/safe-zone')
-                .then(r => r.json())
-                .then(zone => {
-                    safeZoneCircle = L.circle([zone.center_lat, zone.center_lon], {
-                        color: '#22c55e',
-                        fillColor: '#22c55e',
-                        fillOpacity: 0.1,
-                        radius: zone.radius_meters
-                    }).addTo(map);
-                    safeZoneCircle.bindPopup(`<b>${zone.name}</b><br>Radius: ${zone.radius_meters}m`);
-                });
+            const trail = L.polyline([], {
+                color: '#0EA5E9',
+                weight: 4,
+                opacity: 0.75,
+                dashArray: '6, 8'
+            }).addTo(map);
 
-            // 2. Load historical logs into sidebar and map
-            fetch('/api/alerts')
-                .then(r => r.json())
-                .then(alerts => {
-                    alerts.reverse().forEach(a => handleNewAlert(a, false));
-                });
+            const vehicleIcon = L.divIcon({
+                className: '',
+                html: '<div style="position:relative;display:flex;align-items:center;justify-content:center;width:40px;height:40px;"><div class="pulse-ring"></div><div class="pulse-core"></div></div>',
+                iconSize: [40, 40],
+                iconAnchor: [20, 20]
+            });
 
-            function handleNewAlert(alert, fly = false) {
-                const isDistress = alert.sound_type && (
-                    alert.sound_type.includes("Scream") || 
-                    alert.sound_type.includes("Crying") || 
-                    alert.sound_type.includes("Glass") || 
-                    alert.sound_type.includes("Crash") || 
-                    alert.sound_type.includes("Siren") ||
-                    alert.sound_type.includes("BREACH")
-                );
+            const vehicleMarker = L.marker([31.9539, 35.9106], { icon: vehicleIcon, zIndexOffset: 1000 }).addTo(map);
 
-                if (alert.sound_type && alert.sound_type.includes("BREACH")) {
-                    breachCount++;
+            function toggleMobileDrawer() {
+                const panel = document.getElementById('ops-panel');
+                panel.classList.toggle('collapsed');
+                setTimeout(() => {
+                    map.invalidateSize();
+                }, 340);
+            }
+
+            function onLocation(data) {
+                const lat = data.latitude;
+                const lon = data.longitude;
+                const speed = Math.round((data.speed || 0) * 3.6);
+
+                document.getElementById('stat-speed').innerText = speed + " km/h";
+                vehicleMarker.setLatLng([lat, lon]);
+                trail.addLatLng([lat, lon]);
+
+                if (!centered) {
+                    map.setView([lat, lon], 16);
+                    centered = true;
+                } else {
+                    map.panTo([lat, lon], { animate: true, duration: 0.8 });
                 }
+            }
 
+            function onIncident(alert, fly = false) {
+                const isBreach = alert.status === "IMPOSTOR_BLOCKED" || 
+                                 alert.status === "CRITICAL_ESCALATION" || 
+                                 alert.status === "MANUAL_SOS_TRIGGERED" ||
+                                 alert.status === "DISTRESS_DETECTED" ||
+                                 alert.status === "ESCALATED" ||
+                                 alert.status === "INCIDENT_FLAGGED" ||
+                                 (alert.sound_type && (
+                                     alert.sound_type.toLowerCase().includes("scream") || 
+                                     alert.sound_type.toLowerCase().includes("distress") || 
+                                     alert.sound_type.toLowerCase().includes("crash") ||
+                                     alert.sound_type.toLowerCase().includes("unauthorized")
+                                 ));
+
+                if (isBreach) breachCount++;
                 alertCount++;
-                document.getElementById('total-alerts').innerText = alertCount;
-                document.getElementById('total-breaches').innerText = breachCount;
 
-                const feed = document.getElementById('alert-feed');
-                if (feed.innerHTML.includes("Waiting for device telemetry")) {
+                document.getElementById('stat-alerts').innerText = alertCount;
+                document.getElementById('stat-breaches').innerText = breachCount;
+
+                const feed = document.getElementById('feed-container');
+                if (feed.innerHTML.includes("Monitoring active vehicle")) {
                     feed.innerHTML = "";
                 }
 
                 const card = document.createElement('div');
-                card.className = `alert-card ${isDistress ? 'breach' : ''}`;
+                card.className = `event-card ${isBreach ? 'escalated' : 'safe'}`;
                 card.innerHTML = `
-                    <div class="alert-card-header">
-                        <span class="alert-type">${alert.sound_type}</span>
-                        <span class="alert-badge ${isDistress ? 'badge-breach' : 'badge-safe'}">
-                            ${isDistress ? 'Alert' : 'Normal'}
+                    <div class="card-top">
+                        <div class="card-title">${alert.sound_type}</div>
+                        <span class="badge ${isBreach ? 'badge-breach' : 'badge-safe'}">
+                            ${isBreach ? 'PRIORITY DISPATCH' : 'PASSENGER SAFE'}
                         </span>
                     </div>
-                    <div class="alert-details">
-                        <span>Confidence: ${(alert.confidence * 100).toFixed(0)}% | Distance: ${alert.distance_meters || 0}m</span>
-                        <span style="font-size: 11px; opacity: 0.7;">${alert.timestamp}</span>
+                    <div class="card-body">
+                        ${alert.details || 'Cabin status logged.'}
+                    </div>
+                    <div class="card-footer">
+                        <span>CONFIDENCE: ${(alert.confidence * 100).toFixed(0)}%</span>
+                        <span>${alert.timestamp || 'Just now'}</span>
                     </div>
                 `;
-                feed.prepend(card);
 
-                // RESTORED: Add map marker and animate map view
                 if (alert.latitude && alert.longitude) {
-                    var marker = L.marker([alert.latitude, alert.longitude]).addTo(map);
-                    marker.bindPopup(`<b>${alert.sound_type}</b><br>Confidence: ${(alert.confidence * 100).toFixed(0)}%`);
-                    
-                    if (fly) {
-                        map.flyTo([alert.latitude, alert.longitude], 15, { animate: true, duration: 1.2 });
-                        marker.openPopup();
-                    }
+                    card.onclick = () => {
+                        map.flyTo([alert.latitude, alert.longitude], 16, { animate: true, duration: 1.0 });
+                    };
+
+                    const marker = L.circleMarker([alert.latitude, alert.longitude], {
+                        radius: 8,
+                        fillColor: isBreach ? '#EF4444' : '#10B981',
+                        color: '#FFFFFF',
+                        weight: 2,
+                        fillOpacity: 0.95
+                    }).addTo(map);
+
+                    marker.bindPopup(`<b>${alert.sound_type}</b><br>${isBreach ? 'PRIORITY DISPATCH' : 'PASSENGER SAFE'}`);
+                    if (fly) marker.openPopup();
                 }
+
+                feed.prepend(card);
             }
 
-            // 3. Connect to WebSocket
-            var wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            var ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
+            fetch('/api/alerts')
+                .then(r => r.json())
+                .then(data => data.reverse().forEach(a => onIncident(a, false)))
+                .catch(() => {});
 
-            ws.onopen = function() {
-                var el = document.getElementById('connection-status');
-                el.innerHTML = "🟢 Live Link Active";
+            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
+
+            ws.onopen = () => {
+                document.getElementById('conn-status').innerText = "Live Telemetry";
             };
 
-            ws.onmessage = function(event) {
-                var alert = JSON.parse(event.data);
-                handleNewAlert(alert, true);
+            ws.onmessage = (e) => {
+                const packet = JSON.parse(e.data);
+                if (packet.type === "LOCATION_TELEMETRY") {
+                    onLocation(packet);
+                } else {
+                    onIncident(packet, true);
+                }
             };
 
-            ws.onclose = function() {
-                var el = document.getElementById('connection-status');
-                el.innerHTML = "🔴 Feed Disconnected";
-                el.style.color = "var(--accent-red)";
+            ws.onclose = () => {
+                const el = document.getElementById('conn-pill');
+                el.style.color = "#EF4444";
+                document.getElementById('conn-status').innerText = "Offline";
             };
         </script>
     </body>
     </html>
     """
+    
+
+class CompanionChatPayload(BaseModel):
+    child_id: str = "child_01"
+    message: str
+    latitude: float | None = None
+    longitude: float | None = None
+
+class CompanionChatEvaluation(BaseModel):
+    reply: str
+    language: str  # "en" or "ar"
+    is_distress: bool
+    distress_category: str | None = None
+    recommended_action: str | None = None
+
+@app.post("/api/companion/chat")
+async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = Depends(get_db)):
+    chat_eval = None
+
+    if gemini_client:
+        try:
+            eval_prompt = f"""
+            You are "PetraBuddy", a friendly in-cabin safety companion for an unaccompanied child in a Petra Ride vehicle in Amman, Jordan.
+            The child said: "{payload.message}"
+
+            LANGUAGE RULE:
+            - If the child writes in Arabic, respond in warm, comforting Jordanian Arabic (Levantine dialect), addressing them warmly ("يا بطل" or "يا شاطرة"). Set language="ar".
+            - If the child writes in English or any other language, respond in friendly, encouraging English. Set language="en".
+
+            SAFETY ASSESSMENT:
+            - Evaluate if the child expresses distress, fear, reckless driving, route deviation, harassment, or discomfort (is_distress: true/false).
+            - Output structured JSON matching the schema.
+            """
+
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[eval_prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CompanionChatEvaluation,
+                    temperature=0.3
+                ),
+            )
+            chat_eval = response.parsed.model_dump()
+        except Exception as e:
+            print(f"Gemini companion chat error: {e}")
+
+    # Fallback if API call fails
+    if not chat_eval:
+        is_arabic = any('\u0600' <= char <= '\u06FF' for char in payload.message)
+        lower_msg = payload.message.lower()
+        is_distress = any(w in lower_msg for w in ["scared", "help", "fast", "danger", "خايف", "صرخ", "سريع", "مساعدة", "طريق"])
+
+        if is_arabic:
+            reply = "أنا معك يا بطل وما تقلق، إذا حاسس بأي خطر اضغط زر المساعدة." if is_distress else "أهلاً يا بطل! رحلتك مع الكابتن مستمرة بأمان، اسألني أي إشي بدك إياه."
+            lang = "ar"
+        else:
+            reply = "I'm right here with you, don't worry. Tap the SOS button if you need help." if is_distress else "Hi champ! Your ride is going smoothly. Let me know if you need anything!"
+            lang = "en"
+
+        chat_eval = {
+            "reply": reply,
+            "language": lang,
+            "is_distress": is_distress,
+            "distress_category": "CABIN_CONCERN" if is_distress else None,
+            "recommended_action": "Contact Captain" if is_distress else "None"
+        }
+
+    # If distress detected in child's message, broadcast to /map immediately
+    if chat_eval["is_distress"]:
+        db_alert = models.Alert(
+            sound_type=f"PASSENGER CHAT: {chat_eval.get('distress_category', 'Distress')}",
+            confidence=0.95,
+            latitude=payload.latitude,
+            longitude=payload.longitude
+        )
+        db.add(db_alert)
+        db.commit()
+
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "💬 Passenger Flagged Concern",
+            "confidence": 0.95,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "status": "CRITICAL_ESCALATION",
+            "timestamp": "Just now",
+            "details": f'Child: "{payload.message}" | Category: {chat_eval.get("distress_category", "Distress")}'
+        })
+
+    return chat_eval
