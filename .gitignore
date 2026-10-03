@@ -15,6 +15,7 @@ __pycache__/
 *.dll
 *.so
 *.dylib
+*.ckpt
 
 # ==============================
 # Node & JavaScript Dependencies

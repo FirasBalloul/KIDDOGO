@@ -1,16 +1,20 @@
 import os
 import base64
+import time
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+
 import models
 from database import engine, get_db
 from voice_verifier import enroll_child_voice, verify_speaker
+from fusion_engine import fusion_engine
 
 from google import genai
 from google.genai import types
@@ -28,7 +32,25 @@ if GEMINI_KEY:
     except Exception as e:
         print(f"Gemini client notice: {e}")
 
+# --- GLOBAL DYNAMIC TELEMETRY CACHE ---
+# Default starting point: Amman (King Hussein Business Park area)
+latest_vehicle_telemetry = {
+    "child_id": "child_01",
+    "latitude": 31.9715,
+    "longitude": 35.8354,
+    "speed": 0.0,
+    "last_updated": time.time()
+}
+
 # --- SCHEMAS ---
+router = APIRouter(prefix="/api/incident", tags=["Incidents"])
+
+class SpatialBreachPayload(BaseModel):
+    event_type: str
+    target_limb: Optional[str] = "UNKNOWN"
+    timestamp: float
+    zone: str = "REAR_CABIN"
+    
 class LocationTelemetry(BaseModel):
     child_id: str = "child_01"
     latitude: float
@@ -55,6 +77,20 @@ class TriageAnalysis(BaseModel):
     reassurance_speech_en: str
     log_summary: str
 
+class CompanionChatPayload(BaseModel):
+    child_id: str = "child_01"
+    message: str
+    latitude: float | None = None
+    longitude: float | None = None
+
+class CompanionChatEvaluation(BaseModel):
+    reply: str
+    language: str
+    is_distress: bool
+    distress_category: str | None = None
+    recommended_action: str | None = None
+
+
 # --- WEBSOCKET MANAGER ---
 class ConnectionManager:
     def __init__(self):
@@ -77,13 +113,78 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# --- ROUTES ---
+
+# --- INCIDENT ROUTER (SPATIAL SENTINEL) ---
+@router.post("/boundary-breach")
+async def handle_spatial_breach(payload: SpatialBreachPayload, db: Session = Depends(get_db)):
+    global latest_vehicle_telemetry
+    limb_name = payload.target_limb or "UNKNOWN_LIMB"
+    print(f"\n[SPATIAL SENSOR] Zone: {payload.zone} | Limb: {limb_name}")
+
+    # Evaluate event across temporal sliding window
+    fusion_result = fusion_engine.record_vision_breach(zone=payload.zone, limb=limb_name)
+
+    # Attach to active dynamic vehicle GPS position
+    current_lat = latest_vehicle_telemetry["latitude"]
+    current_lon = latest_vehicle_telemetry["longitude"]
+
+    # Persist incident in database
+    db_alert = models.Alert(
+        sound_type=fusion_result["classification"],
+        confidence=fusion_result["fused_score"],
+        latitude=current_lat,
+        longitude=current_lon
+    )
+    db.add(db_alert)
+    db.commit()
+    db.refresh(db_alert)
+
+    # Broadcast fused assessment to operations dashboard with real location
+    await manager.broadcast({
+        "type": "INCIDENT_ALERT",
+        "sound_type": f"FUSION: {fusion_result['classification']}",
+        "confidence": fusion_result["fused_score"],
+        "latitude": current_lat,
+        "longitude": current_lon,
+        "status": fusion_result["status"],
+        "timestamp": "Just now",
+        "details": f"{fusion_result['summary']} ({limb_name})"
+    })
+
+    return {
+        "status": "ACKNOWLEDGED",
+        "location": {"lat": current_lat, "lon": current_lon},
+        "fusion": fusion_result
+    }
+
+# Mount the incident router
+app.include_router(router)
+
+
+# --- GENERAL ROUTES ---
 @app.get("/")
 def health_check():
     return {"status": "Petra Ride SafeTrack Online"}
 
+@app.get("/api/telemetry/current")
+def get_current_telemetry():
+    """Returns the latest active GPS coordinates so the frontend can initialize precisely."""
+    global latest_vehicle_telemetry
+    return latest_vehicle_telemetry
+
 @app.post("/api/telemetry/location")
 async def update_live_location(telemetry: LocationTelemetry):
+    global latest_vehicle_telemetry
+    
+    # Cache active position
+    latest_vehicle_telemetry["latitude"] = telemetry.latitude
+    latest_vehicle_telemetry["longitude"] = telemetry.longitude
+    latest_vehicle_telemetry["speed"] = telemetry.speed or 0.0
+    latest_vehicle_telemetry["last_updated"] = time.time()
+
+    # Inform fusion engine of vehicle kinematics (speed in km/h)
+    fusion_engine.record_kinematics(speed_kmh=(telemetry.speed or 0.0) * 3.6)
+
     await manager.broadcast({
         "type": "LOCATION_TELEMETRY",
         "child_id": telemetry.child_id,
@@ -91,31 +192,44 @@ async def update_live_location(telemetry: LocationTelemetry):
         "longitude": telemetry.longitude,
         "speed": telemetry.speed or 0.0
     })
-    return {"status": "OK"}
+    return {"status": "OK", "cached_position": [telemetry.latitude, telemetry.longitude]}
 
 @app.post("/api/alerts")
 async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
+    global latest_vehicle_telemetry
+
+    # Use telemetry position if not explicitly supplied
+    alert_lat = alert.latitude if alert.latitude is not None else latest_vehicle_telemetry["latitude"]
+    alert_lon = alert.longitude if alert.longitude is not None else latest_vehicle_telemetry["longitude"]
+
+    # Feed acoustic event into fusion engine
+    fusion_result = fusion_engine.record_audio_event(
+        sound_type=alert.sound_type,
+        confidence=alert.confidence
+    )
+
     db_alert = models.Alert(
         sound_type=alert.sound_type,
         confidence=alert.confidence,
-        latitude=alert.latitude,
-        longitude=alert.longitude
+        latitude=alert_lat,
+        longitude=alert_lon
     )
     db.add(db_alert)
     db.commit()
     db.refresh(db_alert)
 
+    # Broadcast correlated alert
     await manager.broadcast({
         "type": "INCIDENT_ALERT",
-        "sound_type": db_alert.sound_type,
-        "confidence": db_alert.confidence,
-        "latitude": db_alert.latitude,
-        "longitude": db_alert.longitude,
-        "status": alert.status or "DISTRESS_DETECTED",
+        "sound_type": f"{alert.sound_type} ({fusion_result['classification']})",
+        "confidence": fusion_result["fused_score"],
+        "latitude": alert_lat,
+        "longitude": alert_lon,
+        "status": fusion_result["status"],
         "timestamp": str(db_alert.timestamp),
-        "details": f"Acoustic register: {alert.sound_type}"
+        "details": fusion_result["summary"]
     })
-    return {"status": "DISPATCHED", "alert_id": db_alert.id}
+    return {"status": "DISPATCHED", "fusion": fusion_result, "pinned_at": [alert_lat, alert_lon]}
 
 @app.get("/api/alerts")
 def get_all_alerts(db: Session = Depends(get_db)):
@@ -128,7 +242,11 @@ async def enroll_voice_endpoint(payload: VoicePayload):
 
 @app.post("/api/voice/verify")
 async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get_db)):
+    global latest_vehicle_telemetry
     audio_bytes = base64.b64decode(payload.audio_base64)
+    current_lat = latest_vehicle_telemetry["latitude"]
+    current_lon = latest_vehicle_telemetry["longitude"]
+
     verification_result = verify_speaker(payload.child_id, audio_bytes)
 
     if not verification_result["verified"]:
@@ -136,6 +254,8 @@ async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get
             "type": "INCIDENT_ALERT",
             "sound_type": "Unauthorized Voice Intervention",
             "confidence": verification_result.get("similarity", 0.0),
+            "latitude": current_lat,
+            "longitude": current_lon,
             "status": "IMPOSTOR_BLOCKED",
             "timestamp": "Just now",
             "details": "Captain or third-party voice detected during child check-in confirmation."
@@ -190,6 +310,8 @@ async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get
         "type": "INCIDENT_ALERT",
         "sound_type": triage_data['detected_situation'],
         "confidence": verification_result["similarity"],
+        "latitude": current_lat,
+        "longitude": current_lon,
         "status": "CRITICAL_ESCALATION" if triage_data["is_emergency"] else "VERIFIED_SAFE",
         "timestamp": "Just now",
         "details": triage_data["log_summary"]
@@ -197,8 +319,84 @@ async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get
 
     return {**verification_result, "triage": triage_data}
 
+@app.post("/api/companion/chat")
+async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = Depends(get_db)):
+    global latest_vehicle_telemetry
+    chat_eval = None
 
+    current_lat = payload.latitude if payload.latitude is not None else latest_vehicle_telemetry["latitude"]
+    current_lon = payload.longitude if payload.longitude is not None else latest_vehicle_telemetry["longitude"]
 
+    if gemini_client:
+        try:
+            eval_prompt = f"""
+            You are "PetraBuddy", a friendly in-cabin safety companion for an unaccompanied child in a Petra Ride vehicle in Amman, Jordan.
+            The child said: "{payload.message}"
+
+            LANGUAGE RULE:
+            - If the child writes in Arabic, respond in warm, comforting Jordanian Arabic (Levantine dialect), addressing them warmly ("يا بطل" or "يا شاطرة"). Set language="ar".
+            - If the child writes in English or any other language, respond in friendly, encouraging English. Set language="en".
+
+            SAFETY ASSESSMENT:
+            - Evaluate if the child expresses distress, fear, reckless driving, route deviation, harassment, or discomfort (is_distress: true/false).
+            - Output structured JSON matching the schema.
+            """
+
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[eval_prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CompanionChatEvaluation,
+                    temperature=0.3
+                ),
+            )
+            chat_eval = response.parsed.model_dump()
+        except Exception as e:
+            print(f"Gemini companion chat error: {e}")
+
+    if not chat_eval:
+        is_arabic = any('\u0600' <= char <= '\u06FF' for char in payload.message)
+        lower_msg = payload.message.lower()
+        is_distress = any(w in lower_msg for w in ["scared", "help", "fast", "danger", "خايف", "صرخ", "سريع", "مساعدة", "طريق"])
+
+        if is_arabic:
+            reply = "أنا معك يا بطل وما تقلق، إذا حاسس بأي خطر اضغط زر المساعدة." if is_distress else "أهلاً يا بطل! رحلتك مع الكابتن مستمرة بأمان، اسألني أي إشي بدك إياه."
+            lang = "ar"
+        else:
+            reply = "I'm right here with you, don't worry. Tap the SOS button if you need help." if is_distress else "Hi champ! Your ride is going smoothly. Let me know if you need anything!"
+            lang = "en"
+
+        chat_eval = {
+            "reply": reply,
+            "language": lang,
+            "is_distress": is_distress,
+            "distress_category": "CABIN_CONCERN" if is_distress else None,
+            "recommended_action": "Contact Captain" if is_distress else "None"
+        }
+
+    if chat_eval["is_distress"]:
+        db_alert = models.Alert(
+            sound_type=f"PASSENGER CHAT: {chat_eval.get('distress_category', 'Distress')}",
+            confidence=0.95,
+            latitude=current_lat,
+            longitude=current_lon
+        )
+        db.add(db_alert)
+        db.commit()
+
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "💬 Passenger Flagged Concern",
+            "confidence": 0.95,
+            "latitude": current_lat,
+            "longitude": current_lon,
+            "status": "CRITICAL_ESCALATION",
+            "timestamp": "Just now",
+            "details": f'Child: "{payload.message}" | Category: {chat_eval.get("distress_category", "Distress")}'
+        })
+
+    return chat_eval
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -252,7 +450,6 @@ def render_map():
 
             #map { flex: 1; height: 100vh; background: #06090E; }
 
-            /* Desktop Sidebar vs Mobile Drawer */
             #ops-panel {
                 width: 420px;
                 background: var(--bg-surface);
@@ -337,7 +534,6 @@ def render_map():
                 box-shadow: 0 0 8px var(--status-green);
             }
 
-            /* Captain Card Component */
             .captain-badge-card {
                 background: var(--bg-card);
                 border: 1px solid var(--border-subtle);
@@ -367,17 +563,19 @@ def render_map():
             .captain-meta h4 { font-size: 12px; font-weight: 700; color: #FFF; }
             .captain-meta p { font-size: 10px; color: var(--text-secondary); margin-top: 1px; }
 
-            .kids-certified {
+            .gps-sync-btn {
                 background: rgba(14, 165, 233, 0.15);
                 color: var(--brand-cyan);
-                font-size: 9px;
-                font-weight: 800;
-                padding: 3px 7px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 5px 9px;
                 border-radius: 6px;
-                border: 1px solid rgba(14, 165, 233, 0.3);
+                border: 1px solid rgba(14, 165, 233, 0.35);
+                cursor: pointer;
+                transition: background 0.2s;
             }
+            .gps-sync-btn:hover { background: rgba(14, 165, 233, 0.3); }
 
-            /* Telemetry Row */
             .telemetry-strip {
                 display: grid;
                 grid-template-columns: 1fr 1fr 1fr;
@@ -411,7 +609,6 @@ def render_map():
                 margin-top: 2px;
             }
 
-            /* Feed Area */
             .feed-header {
                 padding: 12px 24px 6px 24px;
                 font-size: 10px;
@@ -488,33 +685,12 @@ def render_map():
                 color: #64748B;
             }
 
-            /* Responsive Mobile Layout Fix */
             @media (max-width: 768px) {
-                body { 
-                    flex-direction: column-reverse; 
-                    height: 100vh;
-                    overflow: hidden;
-                }
-
+                body { flex-direction: column-reverse; height: 100vh; overflow: hidden; }
                 .drawer-handle-bar { display: flex; }
-
-                #ops-panel {
-                    width: 100%;
-                    height: 60vh;
-                    border-right: none;
-                    border-top: 1px solid var(--border-subtle);
-                    border-radius: 22px 22px 0 0;
-                }
-
-                #ops-panel.collapsed {
-                    height: 26vh;
-                }
-
-                #map { 
-                    flex: 1; 
-                    height: auto; 
-                }
-
+                #ops-panel { width: 100%; height: 60vh; border-right: none; border-top: 1px solid var(--border-subtle); border-radius: 22px 22px 0 0; }
+                #ops-panel.collapsed { height: 26vh; }
+                #map { flex: 1; height: auto; }
                 .panel-header { padding: 10px 18px 12px 18px; }
                 .captain-badge-card { padding: 8px 10px; margin-top: 6px; }
                 .telemetry-strip { padding: 6px 18px; }
@@ -522,7 +698,6 @@ def render_map():
                 #feed-container { padding: 6px 18px 24px 18px; }
             }
 
-            /* Vehicle Pulsing Avatar */
             .pulse-ring {
                 position: absolute;
                 width: 38px;
@@ -573,7 +748,7 @@ def render_map():
                             <p>Trip PR-9942 • Plate 24-81923</p>
                         </div>
                     </div>
-                    <span class="kids-certified">★ KIDS VERIFIED</span>
+                    <button class="gps-sync-btn" onclick="syncBrowserGPS()">📍 SYNC DEVICE GPS</button>
                 </div>
             </div>
 
@@ -593,8 +768,8 @@ def render_map():
             </div>
 
             <div class="feed-header">
-                <span>In-Cabin Audio Telemetry</span>
-                <span style="font-family: 'JetBrains Mono', monospace; font-size: 9px;">AMMAN - JORDAN</span>
+                <span>In-Cabin Telemetry & Vision</span>
+                <span id="location-label" style="font-family: 'JetBrains Mono', monospace; font-size: 9px;">AMMAN - JORDAN</span>
             </div>
 
             <div id="feed-container">
@@ -607,7 +782,10 @@ def render_map():
         <main id="map"></main>
 
         <script>
-            const map = L.map('map', { zoomControl: false }).setView([31.9539, 35.9106], 15);
+            let currentLat = 31.9715;
+            let currentLon = 35.8354;
+
+            const map = L.map('map', { zoomControl: false }).setView([currentLat, currentLon], 15);
             L.control.zoom({ position: 'bottomright' }).addTo(map);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 
@@ -620,7 +798,7 @@ def render_map():
                 weight: 4,
                 opacity: 0.75,
                 dashArray: '6, 8'
-            }).addTo(map);
+            });
 
             const vehicleIcon = L.divIcon({
                 className: '',
@@ -629,14 +807,68 @@ def render_map():
                 iconAnchor: [20, 20]
             });
 
-            const vehicleMarker = L.marker([31.9539, 35.9106], { icon: vehicleIcon, zIndexOffset: 1000 }).addTo(map);
+            const vehicleMarker = L.marker([currentLat, currentLon], { icon: vehicleIcon, zIndexOffset: 1000 }).addTo(map);
+
+            // Fetch server's current cached GPS on initial load
+            fetch('/api/telemetry/current')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.latitude && data.longitude) {
+                        onLocation(data);
+                    }
+                })
+                .catch(() => {});
 
             function toggleMobileDrawer() {
                 const panel = document.getElementById('ops-panel');
                 panel.classList.toggle('collapsed');
-                setTimeout(() => {
-                    map.invalidateSize();
-                }, 340);
+                setTimeout(() => { map.invalidateSize(); }, 340);
+            }
+
+            function syncBrowserGPS() {
+                const btn = document.querySelector('.gps-sync-btn');
+                btn.innerText = "📍 LOCATING...";
+
+                const pushLocation = (lat, lon, label) => {
+                    btn.innerText = "✅ " + label;
+                    fetch('/api/telemetry/location', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            child_id: "child_01",
+                            latitude: lat,
+                            longitude: lon,
+                            speed: 0.0
+                        })
+                    });
+                };
+
+                if (navigator.geolocation) {
+                    navigator.geolocation.getCurrentPosition(
+                        (pos) => {
+                            pushLocation(pos.coords.latitude, pos.coords.longitude, "GPS LOCKED");
+                        },
+                        (err) => {
+                            console.warn("Browser GPS blocked, falling back to IP Geolocation:", err.message);
+                            // Fallback: IP-based lookup for Amman
+                            fetch('https://ipapi.co/json/')
+                                .then(res => res.json())
+                                .then(data => {
+                                    if (data && data.latitude && data.longitude) {
+                                        pushLocation(data.latitude, data.longitude, "IP LOC LOCKED");
+                                    } else {
+                                        btn.innerText = "❌ GPS BLOCKED";
+                                    }
+                                })
+                                .catch(() => {
+                                    btn.innerText = "❌ GPS BLOCKED";
+                                });
+                        },
+                        { enableHighAccuracy: true, timeout: 5000 }
+                    );
+                } else {
+                    btn.innerText = "❌ NOT SUPPORTED";
+                }
             }
 
             function onLocation(data) {
@@ -645,6 +877,8 @@ def render_map():
                 const speed = Math.round((data.speed || 0) * 3.6);
 
                 document.getElementById('stat-speed').innerText = speed + " km/h";
+                document.getElementById('location-label').innerText = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+
                 vehicleMarker.setLatLng([lat, lon]);
                 trail.addLatLng([lat, lon]);
 
@@ -667,7 +901,9 @@ def render_map():
                                      alert.sound_type.toLowerCase().includes("scream") || 
                                      alert.sound_type.toLowerCase().includes("distress") || 
                                      alert.sound_type.toLowerCase().includes("crash") ||
-                                     alert.sound_type.toLowerCase().includes("unauthorized")
+                                     alert.sound_type.toLowerCase().includes("unauthorized") ||
+                                     alert.sound_type.toLowerCase().includes("spatial") ||
+                                     alert.sound_type.toLowerCase().includes("replay")
                                  ));
 
                 if (isBreach) breachCount++;
@@ -701,7 +937,7 @@ def render_map():
 
                 if (alert.latitude && alert.longitude) {
                     card.onclick = () => {
-                        map.flyTo([alert.latitude, alert.longitude], 16, { animate: true, duration: 1.0 });
+                        map.flyTo([alert.latitude, alert.longitude], 17, { animate: true, duration: 1.0 });
                     };
 
                     const marker = L.circleMarker([alert.latitude, alert.longitude], {
@@ -749,94 +985,3 @@ def render_map():
     </body>
     </html>
     """
-    
-
-class CompanionChatPayload(BaseModel):
-    child_id: str = "child_01"
-    message: str
-    latitude: float | None = None
-    longitude: float | None = None
-
-class CompanionChatEvaluation(BaseModel):
-    reply: str
-    language: str  # "en" or "ar"
-    is_distress: bool
-    distress_category: str | None = None
-    recommended_action: str | None = None
-
-@app.post("/api/companion/chat")
-async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = Depends(get_db)):
-    chat_eval = None
-
-    if gemini_client:
-        try:
-            eval_prompt = f"""
-            You are "PetraBuddy", a friendly in-cabin safety companion for an unaccompanied child in a Petra Ride vehicle in Amman, Jordan.
-            The child said: "{payload.message}"
-
-            LANGUAGE RULE:
-            - If the child writes in Arabic, respond in warm, comforting Jordanian Arabic (Levantine dialect), addressing them warmly ("يا بطل" or "يا شاطرة"). Set language="ar".
-            - If the child writes in English or any other language, respond in friendly, encouraging English. Set language="en".
-
-            SAFETY ASSESSMENT:
-            - Evaluate if the child expresses distress, fear, reckless driving, route deviation, harassment, or discomfort (is_distress: true/false).
-            - Output structured JSON matching the schema.
-            """
-
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[eval_prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CompanionChatEvaluation,
-                    temperature=0.3
-                ),
-            )
-            chat_eval = response.parsed.model_dump()
-        except Exception as e:
-            print(f"Gemini companion chat error: {e}")
-
-    # Fallback if API call fails
-    if not chat_eval:
-        is_arabic = any('\u0600' <= char <= '\u06FF' for char in payload.message)
-        lower_msg = payload.message.lower()
-        is_distress = any(w in lower_msg for w in ["scared", "help", "fast", "danger", "خايف", "صرخ", "سريع", "مساعدة", "طريق"])
-
-        if is_arabic:
-            reply = "أنا معك يا بطل وما تقلق، إذا حاسس بأي خطر اضغط زر المساعدة." if is_distress else "أهلاً يا بطل! رحلتك مع الكابتن مستمرة بأمان، اسألني أي إشي بدك إياه."
-            lang = "ar"
-        else:
-            reply = "I'm right here with you, don't worry. Tap the SOS button if you need help." if is_distress else "Hi champ! Your ride is going smoothly. Let me know if you need anything!"
-            lang = "en"
-
-        chat_eval = {
-            "reply": reply,
-            "language": lang,
-            "is_distress": is_distress,
-            "distress_category": "CABIN_CONCERN" if is_distress else None,
-            "recommended_action": "Contact Captain" if is_distress else "None"
-        }
-
-    # If distress detected in child's message, broadcast to /map immediately
-    if chat_eval["is_distress"]:
-        db_alert = models.Alert(
-            sound_type=f"PASSENGER CHAT: {chat_eval.get('distress_category', 'Distress')}",
-            confidence=0.95,
-            latitude=payload.latitude,
-            longitude=payload.longitude
-        )
-        db.add(db_alert)
-        db.commit()
-
-        await manager.broadcast({
-            "type": "INCIDENT_ALERT",
-            "sound_type": "💬 Passenger Flagged Concern",
-            "confidence": 0.95,
-            "latitude": payload.latitude,
-            "longitude": payload.longitude,
-            "status": "CRITICAL_ESCALATION",
-            "timestamp": "Just now",
-            "details": f'Child: "{payload.message}" | Category: {chat_eval.get("distress_category", "Distress")}'
-        })
-
-    return chat_eval
