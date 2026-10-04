@@ -1,0 +1,236 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="100%" height="100%" style="background:#07090E; font-family:'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="bgGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="edgeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0369A1" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#0C4A6E" stop-opacity="0.05" />
+    </linearGradient>
+    <linearGradient id="backendGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#15803D" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#14532D" stop-opacity="0.05" />
+    </linearGradient>
+    <linearGradient id="aiGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4F46E5" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#312E81" stop-opacity="0.05" />
+    </linearGradient>
+    <linearGradient id="portalGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#D97706" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#78350F" stop-opacity="0.05" />
+    </linearGradient>
+    
+    <!-- Shadow Filter -->
+    <filter id="cardShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+    
+    <!-- Markers -->
+    <marker id="arrowCyan" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 Z" fill="#38BDF8" />
+    </marker>
+    <marker id="arrowEmerald" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 Z" fill="#34D399" />
+    </marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 Z" fill="#818CF8" />
+    </marker>
+    <marker id="arrowAmber" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 Z" fill="#FBBF24" />
+    </marker>
+  </defs>
+
+  <!-- HEADER -->
+  <g transform="translate(60, 40)">
+    <rect width="1480" height="70" rx="12" fill="#0B1120" stroke="#1E293B" stroke-width="1.5" />
+    <circle cx="35" cy="35" r="18" fill="#0284C7" fill-opacity="0.2" stroke="#38BDF8" stroke-width="1.5" />
+    <text x="35" y="41" font-size="18" text-anchor="middle" fill="#38BDF8">🛡️</text>
+    <text x="70" y="36" font-size="22" font-weight="800" fill="#F8FAFC" letter-spacing="0.5">GUARDIAN RIDE • TECHNICAL SYSTEM ARCHITECTURE</text>
+    <text x="70" y="55" font-size="12" font-weight="600" fill="#94A3B8">Multi-Modal In-Cabin Safety &amp; Transit Monitoring Platform (MVP Feasibility Specification)</text>
+    
+    <rect x="1310" y="20" width="145" height="30" rx="6" fill="#1E293B" stroke="#334155" />
+    <text x="1382" y="40" font-size="11" font-weight="700" fill="#38BDF8" text-anchor="middle">STAGE 3: MVP READY</text>
+  </g>
+
+  <!-- ==================== 1. MOBILE CLIENT TIER ==================== -->
+  <g transform="translate(60, 140)">
+    <!-- Container -->
+    <rect width="440" height="580" rx="16" fill="url(#edgeGrad)" stroke="#0284C7" stroke-width="2" filter="url(#cardShadow)" />
+    <rect width="440" height="42" rx="16" fill="#0369A1" fill-opacity="0.25" />
+    <text x="20" y="28" font-size="15" font-weight="800" fill="#38BDF8" letter-spacing="0.4">📱 1. MOBILE EDGE TIER (REACT NATIVE / EXPO)</text>
+    
+    <!-- Microphones / Audio Ingest -->
+    <g transform="translate(20, 60)">
+      <rect width="400" height="95" rx="10" fill="#0F172A" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#F1F5F9">🎙️ Continuous Acoustic Capture</text>
+      <text x="18" y="48" font-size="11.5" fill="#94A3B8">16kHz Mono PCM Audio Stream via Audio Studio</text>
+      <text x="18" y="68" font-size="10.5" fill="#38BDF8" font-family="Consolas, monospace">Buffer: 15,600 samples (0.975s frames)</text>
+    </g>
+
+    <!-- Edge YAMNet Model -->
+    <g transform="translate(20, 175)">
+      <rect width="400" height="115" rx="10" fill="#0F172A" stroke="#38BDF8" stroke-width="1.8" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#38BDF8">⚡ YAMNet TFLite (Edge Inference)</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Real-time Acoustic Distress &amp; Hazard Classifier</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Screams, Cries, Glass Shatter, Crashes, Sirens</text>
+      <text x="18" y="88" font-size="10.5" fill="#34D399" font-family="Consolas, monospace">Threshold: >=20% | Dedicated Danger Scan</text>
+    </g>
+
+    <!-- Companion UI -->
+    <g transform="translate(20, 310)">
+      <rect width="400" height="115" rx="10" fill="#0F172A" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#F1F5F9">🛡️ AI Child Companion &amp; Voice Check-In</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Automated Voice Verification &amp; Safety Triage Modal</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Spoken Prompt: "طمني عليك، كل اشي تمام؟"</text>
+      <text x="18" y="88" font-size="10.5" fill="#FBBF24" font-family="Consolas, monospace">Anti-Impostor Voice Shield Active</text>
+    </g>
+
+    <!-- Telemetry & GPS Tracker -->
+    <g transform="translate(20, 445)">
+      <rect width="400" height="105" rx="10" fill="#0F172A" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#F1F5F9">📍 GPS &amp; Kinematic Telemetry Engine</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">High-Precision Location, Speed &amp; G-Force Delta</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Integrated Leaflet Map &amp; Offline Resilient Queue</text>
+      <text x="18" y="88" font-size="10.5" fill="#38BDF8" font-family="Consolas, monospace">SafePost Queue: Auto-retry on reconnect</text>
+    </g>
+  </g>
+
+  <!-- ==================== 2. BACKEND & FUSION TIER ==================== -->
+  <g transform="translate(540, 140)">
+    <!-- Container -->
+    <rect width="520" height="580" rx="16" fill="url(#backendGrad)" stroke="#16A34A" stroke-width="2" filter="url(#cardShadow)" />
+    <rect width="520" height="42" rx="16" fill="#15803D" fill-opacity="0.25" />
+    <text x="20" y="28" font-size="15" font-weight="800" fill="#4ADE80" letter-spacing="0.4">⚙️ 2. FUSION ENGINE &amp; AI BACKEND (FASTAPI)</text>
+    
+    <!-- REST & WebSocket Router -->
+    <g transform="translate(20, 60)">
+      <rect width="480" height="80" rx="10" fill="#062010" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="26" font-size="14" font-weight="700" fill="#F1F5F9">🌐 REST API &amp; Real-Time WebSocket Gateway</text>
+      <text x="18" y="46" font-size="11.5" fill="#CBD5E1">Ingests Telemetry, Acoustic Triggers &amp; Voice Verification</text>
+      <text x="18" y="64" font-size="10.5" fill="#4ADE80" font-family="Consolas, monospace">Endpoints: /api/telemetry, /api/alerts, /api/voice/*</text>
+    </g>
+
+    <!-- Multi-Modal Fusion Core -->
+    <g transform="translate(20, 160)">
+      <rect width="480" height="130" rx="10" fill="#062010" stroke="#4ADE80" stroke-width="1.8" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#4ADE80">🧠 Multi-Modal Sensor Fusion Engine</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Sliding-Window Late Fusion (Acoustic + Kinematic + Corridor + Vision)</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Weights: Vision (45%), Audio (40%), Kinematics (15%)</text>
+      <text x="18" y="88" font-size="11" fill="#94A3B8">• Contextual Arbitration: Prevents False Alarms from Dropped Items</text>
+      <text x="18" y="108" font-size="10.5" fill="#34D399" font-family="Consolas, monospace">Correlates simultaneous sound + sudden deceleration</text>
+    </g>
+
+    <!-- Safe Corridor Geofence Engine -->
+    <g transform="translate(20, 310)">
+      <rect width="480" height="110" rx="10" fill="#062010" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#F1F5F9">🗺️ Safe Corridor &amp; Anomaly Tracker</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Haversine Point-to-Segment Deviation Detection</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Calibrated Route: Amman Business Park ➔ Mecca St ➔ Abdoun</text>
+      <text x="18" y="88" font-size="10.5" fill="#FBBF24" font-family="Consolas, monospace">Threshold: >800m deviation OR >3min unscheduled stop</text>
+    </g>
+
+    <!-- SpeechBrain ECAPA-TDNN & Gemini -->
+    <g transform="translate(20, 440)">
+      <rect width="480" height="115" rx="10" fill="#062010" stroke="#818CF8" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#A5B4FC">🔊 SpeechBrain ECAPA-TDNN &amp; Gemini AI</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Deep Speaker Verification &amp; Contextual Situation Triage</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Cosine Similarity Match against 192D biometric voice embeddings</text>
+      <text x="18" y="88" font-size="10.5" fill="#818CF8" font-family="Consolas, monospace">Cosine Threshold: >=0.32 | Blocks Captain Override</text>
+    </g>
+  </g>
+
+  <!-- ==================== 3. DISPATCHER & PARENT PORTALS ==================== -->
+  <g transform="translate(1100, 140)">
+    <!-- Container -->
+    <rect width="440" height="580" rx="16" fill="url(#portalGrad)" stroke="#D97706" stroke-width="2" filter="url(#cardShadow)" />
+    <rect width="440" height="42" rx="16" fill="#B45309" fill-opacity="0.25" />
+    <text x="20" y="28" font-size="15" font-weight="800" fill="#FBBF24" letter-spacing="0.4">🖥️ 3. MONITORING PORTALS &amp; STORAGE</text>
+    
+    <!-- Dispatcher Dashboard -->
+    <g transform="translate(20, 60)">
+      <rect width="400" height="120" rx="10" fill="#1C1405" stroke="#FBBF24" stroke-width="1.8" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#FBBF24">🚨 Fleet Operations Dispatcher</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Real-Time Incident Stream &amp; Telemetry Map</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Formatted Incident Feed with local timestamps</text>
+      <text x="18" y="88" font-size="11" fill="#94A3B8">• Verified AI Confidence Scores (e.g. ⚡ 94% Match)</text>
+      <text x="18" y="106" font-size="10.5" fill="#FBBF24" font-family="Consolas, monospace">Instant Zoom-to-Incident on Map Pin</text>
+    </g>
+
+    <!-- Parent Portal -->
+    <g transform="translate(20, 200)">
+      <rect width="400" height="110" rx="10" fill="#1C1405" stroke="#1E293B" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#F1F5F9">👨‍👩‍👧 Parent Live Guardian Portal</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Continuous Family Tracking &amp; Trip Health</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Real-time GPS Breadcrumbs trail &amp; speed gauges</text>
+      <text x="18" y="88" font-size="10.5" fill="#38BDF8" font-family="Consolas, monospace">Encrypted Passenger Trip URL</text>
+    </g>
+
+    <!-- Persistence & Database -->
+    <g transform="translate(20, 330)">
+      <rect width="400" height="115" rx="10" fill="#1C1405" stroke="#9333EA" stroke-width="1.5" />
+      <text x="18" y="28" font-size="14" font-weight="700" fill="#C084FC">🗄️ PostgreSQL Database (Docker)</text>
+      <text x="18" y="48" font-size="11.5" fill="#CBD5E1">Reliable Enterprise Relational Persistence</text>
+      <text x="18" y="68" font-size="11" fill="#94A3B8">• Incident Logs, Telemetry Audit &amp; System Health</text>
+      <text x="18" y="88" font-size="10.5" fill="#C084FC" font-family="Consolas, monospace">Container: petrakids-db (Port 5432)</text>
+    </g>
+
+    <!-- Computer Vision Sentinel -->
+    <g transform="translate(20, 465)">
+      <rect width="400" height="95" rx="10" fill="#1C1405" stroke="#6366F1" stroke-width="1.5" />
+      <text x="18" y="26" font-size="14" font-weight="700" fill="#A5B4FC">📷 MediaPipe Vision Sentinel (Edge/Aux)</text>
+      <text x="18" y="46" font-size="11.5" fill="#CBD5E1">In-Cabin Spatial Boundary &amp; Pose Monitoring</text>
+      <text x="18" y="66" font-size="10.5" fill="#818CF8" font-family="Consolas, monospace">Transmits spatial breach events to Fusion Core</text>
+    </g>
+  </g>
+
+  <!-- ==================== FLOW ARROWS ==================== -->
+  <!-- Mobile to Backend -->
+  <path d="M500,240 L535,240" fill="none" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrowCyan)" />
+  <path d="M500,380 L535,380" fill="none" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrowCyan)" />
+  <path d="M500,500 L535,500" fill="none" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrowCyan)" />
+
+  <!-- Backend to Portals -->
+  <path d="M1060,200 L1095,200" fill="none" stroke="#FBBF24" stroke-width="2.5" marker-end="url(#arrowAmber)" />
+  <path d="M1060,280 L1095,280" fill="none" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrowCyan)" />
+  <path d="M1060,400 L1095,400" fill="none" stroke="#C084FC" stroke-width="2.5" marker-end="url(#arrowPurple)" />
+
+  <!-- ==================== FOOTER ==================== -->
+  <g transform="translate(60, 740)">
+    <rect width="1480" height="190" rx="12" fill="#0B1120" stroke="#1E293B" stroke-width="1.5" />
+    <text x="25" y="32" font-size="15" font-weight="800" fill="#F8FAFC">⚡ KEY TECHNICAL INNOVATIONS &amp; WORKFLOW GUARANTEES (STAGE 3 MVP)</text>
+    
+    <g transform="translate(25, 50)">
+      <rect width="340" height="115" rx="8" fill="#0F172A" stroke="#1E293B" />
+      <text x="15" y="24" font-size="12.5" font-weight="700" fill="#38BDF8">1. Real-Time On-Device AI</text>
+      <text x="15" y="44" font-size="11" fill="#94A3B8">Runs 16kHz YAMNet locally on mobile.</text>
+      <text x="15" y="62" font-size="11" fill="#94A3B8">Sub-30ms inference latency without</text>
+      <text x="15" y="80" font-size="11" fill="#94A3B8">requiring cloud audio streaming.</text>
+    </g>
+
+    <g transform="translate(390, 50)">
+      <rect width="340" height="115" rx="8" fill="#0F172A" stroke="#1E293B" />
+      <text x="15" y="24" font-size="12.5" font-weight="700" fill="#4ADE80">2. Anti-Impostor Voice Shield</text>
+      <text x="15" y="44" font-size="11" fill="#94A3B8">SpeechBrain ECAPA-TDNN verifies</text>
+      <text x="15" y="62" font-size="11" fill="#94A3B8">child's voice signature. Third-party</text>
+      <text x="15" y="80" font-size="11" fill="#94A3B8">driver dismissals are immediately blocked.</text>
+    </g>
+
+    <g transform="translate(755, 50)">
+      <rect width="340" height="115" rx="8" fill="#0F172A" stroke="#1E293B" />
+      <text x="15" y="24" font-size="12.5" font-weight="700" fill="#FBBF24">3. Multi-Modal Late Fusion</text>
+      <text x="15" y="44" font-size="11" fill="#94A3B8">Correlates Audio + Deceleration + GPS.</text>
+      <text x="15" y="62" font-size="11" fill="#94A3B8">Eliminates false alarms from dropped</text>
+      <text x="15" y="80" font-size="11" fill="#94A3B8">items while instantly catching true danger.</text>
+    </g>
+
+    <g transform="translate(1120, 50)">
+      <rect width="335" height="115" rx="8" fill="#0F172A" stroke="#1E293B" />
+      <text x="15" y="24" font-size="12.5" font-weight="700" fill="#C084FC">4. Sub-Second Telemetry Sync</text>
+      <text x="15" y="44" font-size="11" fill="#94A3B8">WebSocket dispatch streams alerts</text>
+      <text x="15" y="62" font-size="11" fill="#94A3B8">to fleet operations within 200ms of</text>
+      <text x="15" y="80" font-size="11" fill="#94A3B8">acoustic/corridor breach validation.</text>
+    </g>
+  </g>
+</svg>

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 import models
 from database import engine, get_db
-from voice_verifier import enroll_child_voice, verify_speaker
+from voice_verifier import enroll_child_voice, verify_speaker, CHILD_VOICE_REGISTRY, PROFILES_DIR
 from fusion_engine import fusion_engine
 
 from google import genai
@@ -56,6 +56,8 @@ class LocationTelemetry(BaseModel):
     latitude: float
     longitude: float
     speed: float | None = 0.0
+    g_force_delta: float | None = 0.0
+    battery_level: float | None = 100.0
 
 class DistressAlert(BaseModel):
     sound_type: str
@@ -68,6 +70,12 @@ class VoicePayload(BaseModel):
     child_id: str = "child_01"
     audio_base64: str
     detected_sound: str = "In-Cabin Acoustic Event"
+
+class VoiceChatPayload(BaseModel):
+    child_id: str = "child_01"
+    audio_base64: str
+    latitude: float | None = None
+    longitude: float | None = None
 
 class TriageAnalysis(BaseModel):
     is_emergency: bool
@@ -89,6 +97,7 @@ class CompanionChatEvaluation(BaseModel):
     is_distress: bool
     distress_category: str | None = None
     recommended_action: str | None = None
+    transcription: str | None = None
 
 
 # --- WEBSOCKET MANAGER ---
@@ -173,26 +182,69 @@ def get_current_telemetry():
     return latest_vehicle_telemetry
 
 @app.post("/api/telemetry/location")
-async def update_live_location(telemetry: LocationTelemetry):
+async def update_live_location(telemetry: LocationTelemetry, db: Session = Depends(get_db)):
     global latest_vehicle_telemetry
     
-    # Cache active position
+    speed_kmh = (telemetry.speed or 0.0) * 3.6
+    g_force = telemetry.g_force_delta or 0.0
+
+    # Cache active position and kinematics
     latest_vehicle_telemetry["latitude"] = telemetry.latitude
     latest_vehicle_telemetry["longitude"] = telemetry.longitude
     latest_vehicle_telemetry["speed"] = telemetry.speed or 0.0
+    latest_vehicle_telemetry["g_force_delta"] = g_force
+    latest_vehicle_telemetry["battery_level"] = telemetry.battery_level or 100.0
     latest_vehicle_telemetry["last_updated"] = time.time()
 
-    # Inform fusion engine of vehicle kinematics (speed in km/h)
-    fusion_engine.record_kinematics(speed_kmh=(telemetry.speed or 0.0) * 3.6)
+    # Inform fusion engine of vehicle kinematics & corridor trajectory
+    corridor_eval = fusion_engine.record_location_telemetry(
+        lat=telemetry.latitude,
+        lon=telemetry.longitude,
+        speed_kmh=speed_kmh,
+        g_force_delta=g_force
+    )
+
+    # Automatically broadcast corridor breaches or unexpected stationary events
+    if corridor_eval.get("is_corridor_deviated"):
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "Route Corridor Deviation Anomaly",
+            "confidence": 0.88,
+            "latitude": telemetry.latitude,
+            "longitude": telemetry.longitude,
+            "status": "INCIDENT_FLAGGED",
+            "timestamp": "Just now",
+            "details": f"Vehicle is {corridor_eval['corridor_distance_meters']}m away from the authorized route corridor."
+        })
+
+    if corridor_eval.get("is_unexpected_stop"):
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "Prolonged Unplanned Stationary Anomaly",
+            "confidence": 0.90,
+            "latitude": telemetry.latitude,
+            "longitude": telemetry.longitude,
+            "status": "INCIDENT_FLAGGED",
+            "timestamp": "Just now",
+            "details": f"Vehicle has been stationary for {corridor_eval['stationary_duration_sec']}s in an unapproved zone."
+        })
 
     await manager.broadcast({
         "type": "LOCATION_TELEMETRY",
         "child_id": telemetry.child_id,
         "latitude": telemetry.latitude,
         "longitude": telemetry.longitude,
-        "speed": telemetry.speed or 0.0
+        "speed": telemetry.speed or 0.0,
+        "g_force_delta": g_force,
+        "battery_level": telemetry.battery_level or 100.0,
+        "corridor_distance_meters": corridor_eval["corridor_distance_meters"],
+        "route_status": corridor_eval["route_status"]
     })
-    return {"status": "OK", "cached_position": [telemetry.latitude, telemetry.longitude]}
+    return {
+        "status": "OK",
+        "cached_position": [telemetry.latitude, telemetry.longitude],
+        "corridor": corridor_eval
+    }
 
 @app.post("/api/alerts")
 async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
@@ -234,6 +286,11 @@ async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
 @app.get("/api/alerts")
 def get_all_alerts(db: Session = Depends(get_db)):
     return db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(30).all()
+
+@app.get("/api/voice/status/{child_id}")
+def get_voice_status(child_id: str):
+    has_profile = child_id in CHILD_VOICE_REGISTRY or (PROFILES_DIR / f"{child_id}.pt").exists()
+    return {"child_id": child_id, "enrolled": has_profile}
 
 @app.post("/api/voice/enroll")
 async def enroll_voice_endpoint(payload: VoicePayload):
@@ -355,10 +412,18 @@ async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = D
         except Exception as e:
             print(f"Gemini companion chat error: {e}")
 
+    LEVANTINE_DISTRESS_KEYWORDS = [
+        "scared", "help", "fast", "danger", "stop", "accident", "crash",
+        "خايف", "صرخ", "سريع", "مساعدة", "طريق", "خطر", "حادث",
+        "وين رايح", "غيرت الطريق", "مش هون الطريق", "وين ماخدني", "مش هاد بيتي", "مش هذا طريقي",
+        "بسرعة كتير", "طاير بالسيارة", "خفف السرعة", "سواقة سريعة", "عم يسرع",
+        "بدي ماما", "بدي بابا", "بدي انزل", "وقف السيارة", "نزلني هون", "مش مرتاح", "عم بصرخ", "هددني"
+    ]
+
     if not chat_eval:
         is_arabic = any('\u0600' <= char <= '\u06FF' for char in payload.message)
         lower_msg = payload.message.lower()
-        is_distress = any(w in lower_msg for w in ["scared", "help", "fast", "danger", "خايف", "صرخ", "سريع", "مساعدة", "طريق"])
+        is_distress = any(w in lower_msg for w in LEVANTINE_DISTRESS_KEYWORDS)
 
         if is_arabic:
             reply = "أنا معك يا بطل وما تقلق، إذا حاسس بأي خطر اضغط زر المساعدة." if is_distress else "أهلاً يا بطل! رحلتك مع الكابتن مستمرة بأمان، اسألني أي إشي بدك إياه."
@@ -372,7 +437,8 @@ async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = D
             "language": lang,
             "is_distress": is_distress,
             "distress_category": "CABIN_CONCERN" if is_distress else None,
-            "recommended_action": "Contact Captain" if is_distress else "None"
+            "recommended_action": "Contact Captain" if is_distress else "None",
+            "transcription": payload.message
         }
 
     if chat_eval["is_distress"]:
@@ -398,6 +464,70 @@ async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = D
 
     return chat_eval
 
+@app.post("/api/companion/chat-voice")
+async def companion_voice_chat_endpoint(payload: VoiceChatPayload, db: Session = Depends(get_db)):
+    global latest_vehicle_telemetry
+    chat_eval = None
+    audio_bytes = base64.b64decode(payload.audio_base64)
+    current_lat = payload.latitude if payload.latitude is not None else latest_vehicle_telemetry["latitude"]
+    current_lon = payload.longitude if payload.longitude is not None else latest_vehicle_telemetry["longitude"]
+
+    if gemini_client:
+        try:
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+            eval_prompt = """
+            You are "PetraBuddy", a caring in-cabin AI safety companion for an unaccompanied child riding in a Petra Ride in Amman, Jordan.
+            1. Transcribe the spoken audio verbatim in 'transcription'.
+            2. If Arabic: reply in warm, comforting Jordanian Levantine Arabic addressing them warmly ("يا بطل" / "يا شاطرة"). Set language="ar".
+            3. If English: reply in cheerful, supportive English. Set language="en".
+            4. Safety Evaluation: Check if the child sounds distressed, scared, reports bad driving, route changes, harassment, or fear (is_distress: true/false).
+            """
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[audio_part, eval_prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CompanionChatEvaluation,
+                    temperature=0.3
+                ),
+            )
+            chat_eval = response.parsed.model_dump()
+        except Exception as e:
+            print(f"Gemini voice chat error: {e}")
+
+    if not chat_eval:
+        chat_eval = {
+            "transcription": "Voice message received",
+            "reply": "سمعت صوتك يا بطل، كل اشي تمام ورحلتك مستمرة بأمان!",
+            "language": "ar",
+            "is_distress": False,
+            "distress_category": None,
+            "recommended_action": None
+        }
+
+    if chat_eval.get("is_distress"):
+        db_alert = models.Alert(
+            sound_type=f"VOICE CHAT: {chat_eval.get('distress_category', 'Distress')}",
+            confidence=0.95,
+            latitude=current_lat,
+            longitude=current_lon
+        )
+        db.add(db_alert)
+        db.commit()
+
+        await manager.broadcast({
+            "type": "INCIDENT_ALERT",
+            "sound_type": "🎙️ Passenger Voice Flagged Concern",
+            "confidence": 0.95,
+            "latitude": current_lat,
+            "longitude": current_lon,
+            "status": "CRITICAL_ESCALATION",
+            "timestamp": "Just now",
+            "details": f'Child Spoke: "{chat_eval.get("transcription", "")}" | Category: {chat_eval.get("distress_category", "Distress")}'
+        })
+
+    return chat_eval
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -415,115 +545,171 @@ def render_map():
     <html lang="en">
     <head>
         <meta charset="UTF-8" />
-        <title>Petra Ride SafeTrack Operations</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+        <title>PetraRide KIDDOGO • Operations Command Deck</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
         
         <style>
             :root {
-                --bg-base: #090D14;
-                --bg-surface: #111726;
-                --bg-card: #182238;
-                --border-subtle: #232F48;
+                --bg-base: #07090E;
+                --bg-surface: #0E131F;
+                --bg-card: #141C2E;
+                --bg-card-hover: #1A243B;
+                --border-subtle: rgba(255, 255, 255, 0.08);
+                --border-medium: rgba(255, 255, 255, 0.14);
+                --border-cyan: rgba(14, 165, 233, 0.35);
                 --text-primary: #F8FAFC;
                 --text-secondary: #94A3B8;
+                --text-muted: #64748B;
                 --brand-cyan: #0EA5E9;
+                --brand-amber: #F59E0B;
                 --brand-cyan-glow: rgba(14, 165, 233, 0.25);
                 --status-green: #10B981;
                 --status-red: #EF4444;
                 --status-amber: #F59E0B;
+                --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                --font-mono: 'JetBrains Mono', monospace;
             }
 
             * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-            body { 
-                font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            html, body {
+                height: 100%;
+                width: 100%;
                 background: var(--bg-base);
                 color: var(--text-primary);
-                height: 100vh;
-                display: flex;
+                font-family: var(--font-sans);
                 overflow: hidden;
             }
 
-            #map { flex: 1; height: 100vh; background: #06090E; }
+            body {
+                display: flex;
+                flex-direction: row;
+            }
 
+            #map {
+                flex: 1;
+                height: 100vh;
+                background: #040609;
+                z-index: 1;
+            }
+
+            /* Operations Sidebar Deck */
             #ops-panel {
-                width: 420px;
+                width: 440px;
+                max-width: 100vw;
+                height: 100vh;
                 background: var(--bg-surface);
                 border-right: 1px solid var(--border-subtle);
                 display: flex;
                 flex-direction: column;
                 z-index: 1000;
-                box-shadow: 10px 0 30px rgba(0,0,0,0.5);
-                transition: height 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+                box-shadow: 12px 0 36px rgba(0, 0, 0, 0.65);
+                position: relative;
+                transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), height 0.35s cubic-bezier(0.16, 1, 0.3, 1);
             }
 
+            /* Mobile Drag Pill */
             .drawer-handle-bar {
                 display: none;
                 width: 100%;
+                padding: 10px 0 4px 0;
                 justify-content: center;
-                padding: 10px 0 6px 0;
-                cursor: pointer;
+                cursor: grab;
+                background: var(--bg-surface);
             }
 
             .drawer-pill {
-                width: 42px;
+                width: 44px;
                 height: 5px;
                 background: #334155;
-                border-radius: 3px;
+                border-radius: 999px;
             }
 
+            /* Panel Header */
             .panel-header {
-                padding: 18px 24px;
+                padding: 20px 22px 16px 22px;
                 border-bottom: 1px solid var(--border-subtle);
-                background: rgba(17, 23, 38, 0.9);
-                backdrop-filter: blur(12px);
+                background: linear-gradient(180deg, rgba(14, 19, 31, 0.98) 0%, rgba(10, 14, 23, 0.95) 100%);
+                backdrop-filter: blur(16px);
             }
 
             .brand-row {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                margin-bottom: 8px;
+                gap: 12px;
+                margin-bottom: 14px;
             }
 
-            .brand-badge {
+            .brand-lockup {
                 display: flex;
                 align-items: center;
-                gap: 8px;
-                font-size: 16px;
-                font-weight: 800;
-                letter-spacing: -0.3px;
-                color: #FFFFFF;
+                gap: 10px;
             }
 
-            .brand-icon {
-                width: 26px;
-                height: 26px;
-                background: var(--brand-cyan);
-                border-radius: 7px;
+            .brand-logo-badge {
+                width: 34px;
+                height: 34px;
+                background: linear-gradient(135deg, #0284C7 0%, #0EA5E9 50%, #38BDF8 100%);
+                border-radius: 10px;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                color: #FFF;
-                font-size: 13px;
+                box-shadow: 0 4px 14px rgba(14, 165, 233, 0.35);
+                border: 1px solid rgba(255, 255, 255, 0.25);
+            }
+
+            .brand-logo-icon {
+                color: #FFFFFF;
+                font-size: 16px;
                 font-weight: 900;
             }
 
-            .live-pill {
+            .brand-title-group h1 {
+                font-size: 16px;
+                font-weight: 900;
+                letter-spacing: -0.3px;
+                color: #FFFFFF;
+                line-height: 1.1;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            .brand-title-group h1 .accent-kiddogo {
+                color: #38BDF8;
+                background: linear-gradient(90deg, #38BDF8, #7DD3FC);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                font-weight: 900;
+                letter-spacing: 0.5px;
+            }
+
+            .brand-title-group p {
+                font-size: 9.5px;
+                font-weight: 700;
+                letter-spacing: 0.8px;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+                margin-top: 3px;
+            }
+
+            .live-indicator-pill {
                 font-size: 11px;
                 font-weight: 700;
                 color: var(--status-green);
                 display: flex;
                 align-items: center;
                 gap: 6px;
-                background: rgba(16, 185, 129, 0.1);
-                border: 1px solid rgba(16, 185, 129, 0.25);
+                background: rgba(16, 185, 129, 0.12);
+                border: 1px solid rgba(16, 185, 129, 0.28);
                 padding: 4px 10px;
-                border-radius: 20px;
+                border-radius: 999px;
+                white-space: nowrap;
             }
 
             .live-dot {
@@ -532,193 +718,336 @@ def render_map():
                 background: var(--status-green);
                 border-radius: 50%;
                 box-shadow: 0 0 8px var(--status-green);
+                animation: pulse-dot 1.8s infinite;
             }
 
-            .captain-badge-card {
+            @keyframes pulse-dot {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50% { opacity: 0.4; transform: scale(0.85); }
+            }
+
+            /* Captain Quick Card */
+            .captain-deck-card {
                 background: var(--bg-card);
-                border: 1px solid var(--border-subtle);
+                border: 1px solid var(--border-medium);
                 border-radius: 12px;
-                padding: 10px 12px;
+                padding: 11px 13px;
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                margin-top: 8px;
+                gap: 10px;
             }
 
-            .captain-left { display: flex; align-items: center; gap: 10px; }
-            .captain-avatar {
-                width: 32px;
-                height: 32px;
-                border-radius: 50%;
-                background: #25334E;
+            .captain-deck-left {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                min-width: 0;
+            }
+
+            .captain-deck-avatar {
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background: #182338;
+                border: 1.5px solid var(--brand-cyan);
+                color: #38BDF8;
+                font-weight: 800;
+                font-size: 13px;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                font-weight: 700;
-                font-size: 12px;
-                color: var(--brand-cyan);
-                border: 1.5px solid var(--brand-cyan);
+                flex-shrink: 0;
             }
 
-            .captain-meta h4 { font-size: 12px; font-weight: 700; color: #FFF; }
-            .captain-meta p { font-size: 10px; color: var(--text-secondary); margin-top: 1px; }
+            .captain-deck-info {
+                min-width: 0;
+            }
 
-            .gps-sync-btn {
-                background: rgba(14, 165, 233, 0.15);
-                color: var(--brand-cyan);
-                font-size: 10px;
-                font-weight: 700;
-                padding: 5px 9px;
-                border-radius: 6px;
+            .captain-deck-info h4 {
+                font-size: 12px;
+                font-weight: 800;
+                color: #F8FAFC;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .captain-deck-info p {
+                font-size: 10.5px;
+                color: var(--text-secondary);
+                margin-top: 1px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .gps-sync-action-btn {
+                background: rgba(14, 165, 233, 0.14);
+                color: #38BDF8;
+                font-family: var(--font-sans);
+                font-size: 10.5px;
+                font-weight: 800;
+                padding: 6px 11px;
+                border-radius: 8px;
                 border: 1px solid rgba(14, 165, 233, 0.35);
                 cursor: pointer;
-                transition: background 0.2s;
+                transition: all 0.2s ease;
+                white-space: nowrap;
+                flex-shrink: 0;
             }
-            .gps-sync-btn:hover { background: rgba(14, 165, 233, 0.3); }
 
-            .telemetry-strip {
+            .gps-sync-action-btn:hover {
+                background: rgba(14, 165, 233, 0.28);
+                transform: translateY(-1px);
+            }
+
+            /* Precision Telemetry Grid */
+            .telemetry-grid {
                 display: grid;
-                grid-template-columns: 1fr 1fr 1fr;
+                grid-template-columns: repeat(3, 1fr);
                 gap: 8px;
-                padding: 10px 24px;
-                background: rgba(15, 22, 38, 0.5);
+                padding: 12px 22px;
+                background: rgba(10, 14, 24, 0.7);
                 border-bottom: 1px solid var(--border-subtle);
             }
 
-            .telemetry-tile {
+            .telemetry-card {
                 background: var(--bg-base);
                 border: 1px solid var(--border-subtle);
-                padding: 6px 8px;
-                border-radius: 8px;
+                padding: 8px 10px;
+                border-radius: 10px;
                 text-align: center;
             }
 
-            .telemetry-tile .val {
-                font-family: 'JetBrains Mono', monospace;
+            .telemetry-card .val {
+                font-family: var(--font-mono);
                 font-size: 14px;
                 font-weight: 700;
-                color: #FFF;
+                color: #F8FAFC;
+                letter-spacing: -0.2px;
             }
 
-            .telemetry-tile .label {
-                font-size: 8px;
-                font-weight: 700;
+            .telemetry-card .lbl {
+                font-size: 8.5px;
+                font-weight: 800;
                 text-transform: uppercase;
-                letter-spacing: 0.5px;
-                color: var(--text-secondary);
+                letter-spacing: 0.6px;
+                color: var(--text-muted);
                 margin-top: 2px;
             }
 
-            .feed-header {
-                padding: 12px 24px 6px 24px;
-                font-size: 10px;
-                font-weight: 700;
+            /* Event Stream Area */
+            .feed-section-header {
+                padding: 14px 22px 8px 22px;
+                font-size: 10.5px;
+                font-weight: 800;
                 text-transform: uppercase;
-                letter-spacing: 0.8px;
+                letter-spacing: 0.9px;
                 color: var(--text-secondary);
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
+            }
+
+            .feed-section-header .loc-tag {
+                font-family: var(--font-mono);
+                font-size: 9.5px;
+                color: #38BDF8;
+                background: rgba(14, 165, 233, 0.12);
+                padding: 2px 7px;
+                border-radius: 6px;
+                border: 1px solid rgba(14, 165, 233, 0.25);
             }
 
             #feed-container {
                 flex: 1;
                 min-height: 0;
                 overflow-y: auto;
-                padding: 8px 24px 20px 24px;
+                padding: 8px 22px 24px 22px;
                 display: flex;
                 flex-direction: column;
                 gap: 10px;
                 -webkit-overflow-scrolling: touch;
             }
 
+            #feed-container::-webkit-scrollbar {
+                width: 5px;
+            }
+            #feed-container::-webkit-scrollbar-thumb {
+                background: #1E293B;
+                border-radius: 4px;
+            }
+
+            .empty-feed-hint {
+                text-align: center;
+                color: var(--text-muted);
+                font-size: 12px;
+                margin-top: 32px;
+                padding: 20px;
+                border: 1px dashed var(--border-subtle);
+                border-radius: 12px;
+                background: rgba(255, 255, 255, 0.01);
+            }
+
+            /* Incident & Telemetry Cards */
             .event-card {
                 background: var(--bg-card);
                 border: 1px solid var(--border-subtle);
                 border-radius: 12px;
-                padding: 12px;
-                transition: transform 0.2s, border-color 0.2s;
+                padding: 12px 14px;
+                transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
                 cursor: pointer;
             }
 
-            .event-card:hover { transform: translateY(-1px); border-color: #384A6E; }
+            .event-card:hover {
+                transform: translateY(-1px);
+                border-color: var(--border-medium);
+                background: var(--bg-card-hover);
+            }
 
             .event-card.escalated {
                 border-color: rgba(239, 68, 68, 0.5);
-                background: linear-gradient(180deg, rgba(239, 68, 68, 0.08) 0%, rgba(24, 34, 56, 0.8) 100%);
+                background: linear-gradient(180deg, rgba(239, 68, 68, 0.12) 0%, rgba(20, 28, 46, 0.9) 100%);
             }
 
             .event-card.safe {
                 border-color: rgba(16, 185, 129, 0.35);
-                background: linear-gradient(180deg, rgba(16, 185, 129, 0.05) 0%, rgba(24, 34, 56, 0.8) 100%);
+                background: linear-gradient(180deg, rgba(16, 185, 129, 0.08) 0%, rgba(20, 28, 46, 0.9) 100%);
             }
 
             .card-top {
                 display: flex;
                 justify-content: space-between;
                 align-items: flex-start;
-                margin-bottom: 5px;
+                gap: 8px;
+                margin-bottom: 6px;
             }
 
-            .card-title { font-size: 12px; font-weight: 700; color: #FFF; line-height: 1.4; flex: 1; padding-right: 8px; }
+            .card-title {
+                font-size: 12.5px;
+                font-weight: 800;
+                color: #FFFFFF;
+                line-height: 1.35;
+                flex: 1;
+            }
 
             .badge {
-                font-size: 8px;
+                font-size: 8.5px;
                 font-weight: 800;
                 text-transform: uppercase;
-                padding: 2px 6px;
-                border-radius: 5px;
+                letter-spacing: 0.5px;
+                padding: 3px 7px;
+                border-radius: 6px;
                 white-space: nowrap;
             }
 
-            .badge-safe { background: rgba(16, 185, 129, 0.15); color: var(--status-green); border: 1px solid rgba(16, 185, 129, 0.3); }
-            .badge-breach { background: rgba(239, 68, 68, 0.15); color: var(--status-red); border: 1px solid rgba(239, 68, 68, 0.4); }
+            .badge-safe {
+                background: rgba(16, 185, 129, 0.15);
+                color: #34D399;
+                border: 1px solid rgba(16, 185, 129, 0.35);
+            }
 
-            .card-body { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
+            .badge-breach {
+                background: rgba(239, 68, 68, 0.2);
+                color: #F87171;
+                border: 1px solid rgba(239, 68, 68, 0.5);
+                animation: breach-glow 1.6s infinite;
+            }
+
+            @keyframes breach-glow {
+                0%, 100% { box-shadow: 0 0 0 rgba(239, 68, 68, 0); }
+                50% { box-shadow: 0 0 10px rgba(239, 68, 68, 0.4); }
+            }
+
+            .card-body {
+                font-size: 11px;
+                color: var(--text-secondary);
+                line-height: 1.45;
+            }
+
             .card-footer {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-top: 8px;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 9px;
-                color: #64748B;
+                margin-top: 10px;
+                font-family: var(--font-mono);
+                font-size: 9.5px;
+                color: var(--text-muted);
             }
 
-            @media (max-width: 768px) {
-                body { flex-direction: column-reverse; height: 100vh; overflow: hidden; }
-                .drawer-handle-bar { display: flex; }
-                #ops-panel { width: 100%; height: 60vh; border-right: none; border-top: 1px solid var(--border-subtle); border-radius: 22px 22px 0 0; }
-                #ops-panel.collapsed { height: 26vh; }
-                #map { flex: 1; height: auto; }
-                .panel-header { padding: 10px 18px 12px 18px; }
-                .captain-badge-card { padding: 8px 10px; margin-top: 6px; }
-                .telemetry-strip { padding: 6px 18px; }
-                .feed-header { padding: 8px 18px 4px 18px; }
-                #feed-container { padding: 6px 18px 24px 18px; }
-            }
-
+            /* Custom Map Vehicle Pulsar Marker */
             .pulse-ring {
                 position: absolute;
-                width: 38px;
-                height: 38px;
+                width: 44px;
+                height: 44px;
                 border-radius: 50%;
-                background: rgba(14, 165, 233, 0.3);
+                background: rgba(14, 165, 233, 0.35);
                 animation: car-radiate 2.2s infinite ease-out;
             }
             .pulse-core {
-                width: 20px;
-                height: 20px;
-                background: #0EA5E9;
+                width: 22px;
+                height: 22px;
+                background: linear-gradient(135deg, #0EA5E9, #0284C7);
                 border: 2.5px solid #FFFFFF;
                 border-radius: 50%;
-                box-shadow: 0 0 16px rgba(14, 165, 233, 0.9);
+                box-shadow: 0 0 18px rgba(14, 165, 233, 0.95);
                 position: relative;
                 z-index: 2;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 10px;
             }
             @keyframes car-radiate {
-                0% { transform: scale(0.6); opacity: 1; }
-                100% { transform: scale(1.7); opacity: 0; }
+                0% { transform: scale(0.5); opacity: 1; }
+                100% { transform: scale(1.8); opacity: 0; }
+            }
+
+            /* Mobile Responsive Layout (Phones & Small Tablets) */
+            @media (max-width: 840px) {
+                body {
+                    flex-direction: column-reverse;
+                    height: 100%;
+                    overflow: hidden;
+                }
+                .drawer-handle-bar {
+                    display: flex;
+                }
+                #ops-panel {
+                    width: 100%;
+                    height: 56vh;
+                    border-right: none;
+                    border-top: 1px solid var(--border-medium);
+                    border-radius: 22px 22px 0 0;
+                    box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.7);
+                }
+                #ops-panel.collapsed {
+                    height: 24vh;
+                }
+                #map {
+                    flex: 1;
+                    height: auto;
+                }
+                .panel-header {
+                    padding: 10px 16px 12px 16px;
+                }
+                .brand-title-group h1 {
+                    font-size: 14.5px;
+                }
+                .captain-deck-card {
+                    padding: 8px 10px;
+                }
+                .telemetry-grid {
+                    padding: 6px 16px;
+                    gap: 6px;
+                }
+                .feed-section-header {
+                    padding: 8px 16px 4px 16px;
+                }
+                #feed-container {
+                    padding: 6px 16px 20px 16px;
+                }
             }
         </style>
     </head>
@@ -730,51 +1059,56 @@ def render_map():
 
             <div class="panel-header">
                 <div class="brand-row">
-                    <div class="brand-badge">
-                        <div class="brand-icon">P</div>
-                        <span>SafeTrack Operations</span>
-                    </div>
-                    <div id="conn-pill" class="live-pill">
-                        <span class="live-dot"></span>
-                        <span id="conn-status">Link Active</span>
-                    </div>
-                </div>
-
-                <div class="captain-badge-card">
-                    <div class="captain-left">
-                        <div class="captain-avatar">AZ</div>
-                        <div class="captain-meta">
-                            <h4>Ahmad Al-Zoubi • Kia Niro</h4>
-                            <p>Trip PR-9942 • Plate 24-81923</p>
+                    <div class="brand-lockup">
+                        <div class="brand-logo-badge">
+                            <span class="brand-logo-icon">🛡️</span>
+                        </div>
+                        <div class="brand-title-group">
+                            <h1>PetraRide <span class="accent-kiddogo">KIDDOGO</span></h1>
+                            <p>Operations Command Deck</p>
                         </div>
                     </div>
-                    <button class="gps-sync-btn" onclick="syncBrowserGPS()">📍 SYNC DEVICE GPS</button>
+                    <div id="conn-pill" class="live-indicator-pill">
+                        <span class="live-dot"></span>
+                        <span id="conn-status">Live Stream</span>
+                    </div>
+                </div>
+
+                <div class="captain-deck-card">
+                    <div class="captain-deck-left">
+                        <div class="captain-deck-avatar">AZ</div>
+                        <div class="captain-deck-info">
+                            <h4>Captain Ahmad Al-Zoubi</h4>
+                            <p>Kia Niro • 24-81923 • Trip PR-9942</p>
+                        </div>
+                    </div>
+                    <button class="gps-sync-action-btn" onclick="syncBrowserGPS()">📍 GPS SYNC</button>
                 </div>
             </div>
 
-            <div class="telemetry-strip">
-                <div class="telemetry-tile">
+            <div class="telemetry-grid">
+                <div class="telemetry-card">
                     <div id="stat-speed" class="val">0 km/h</div>
-                    <div class="label">Speed</div>
+                    <div class="lbl">Transit Speed</div>
                 </div>
-                <div class="telemetry-tile">
+                <div class="telemetry-card">
                     <div id="stat-alerts" class="val">0</div>
-                    <div class="label">Events</div>
+                    <div class="lbl">Total Logs</div>
                 </div>
-                <div class="telemetry-tile">
+                <div class="telemetry-card">
                     <div id="stat-breaches" class="val" style="color: var(--status-red);">0</div>
-                    <div class="label">Priority</div>
+                    <div class="lbl">Priority SOS</div>
                 </div>
             </div>
 
-            <div class="feed-header">
-                <span>In-Cabin Telemetry & Vision</span>
-                <span id="location-label" style="font-family: 'JetBrains Mono', monospace; font-size: 9px;">AMMAN - JORDAN</span>
+            <div class="feed-section-header">
+                <span>Acoustic Sentinel & Cabin Stream</span>
+                <span id="location-label" class="loc-tag">AMMAN, JORDAN</span>
             </div>
 
             <div id="feed-container">
-                <div style="text-align: center; color: #475569; font-size: 12px; margin-top: 24px;">
-                    Monitoring active vehicle corridor...
+                <div class="empty-feed-hint">
+                    Awaiting cabin telemetry. Trajectory and acoustic sentinel active.
                 </div>
             </div>
         </aside>
@@ -796,15 +1130,15 @@ def render_map():
             const trail = L.polyline([], {
                 color: '#0EA5E9',
                 weight: 4,
-                opacity: 0.75,
+                opacity: 0.85,
                 dashArray: '6, 8'
-            });
+            }).addTo(map);
 
             const vehicleIcon = L.divIcon({
                 className: '',
-                html: '<div style="position:relative;display:flex;align-items:center;justify-content:center;width:40px;height:40px;"><div class="pulse-ring"></div><div class="pulse-core"></div></div>',
-                iconSize: [40, 40],
-                iconAnchor: [20, 20]
+                html: '<div style="position:relative;display:flex;align-items:center;justify-content:center;width:44px;height:44px;"><div class="pulse-ring"></div><div class="pulse-core">🚗</div></div>',
+                iconSize: [44, 44],
+                iconAnchor: [22, 22]
             });
 
             const vehicleMarker = L.marker([currentLat, currentLon], { icon: vehicleIcon, zIndexOffset: 1000 }).addTo(map);
@@ -822,11 +1156,11 @@ def render_map():
             function toggleMobileDrawer() {
                 const panel = document.getElementById('ops-panel');
                 panel.classList.toggle('collapsed');
-                setTimeout(() => { map.invalidateSize(); }, 340);
+                setTimeout(() => { map.invalidateSize(); }, 360);
             }
 
             function syncBrowserGPS() {
-                const btn = document.querySelector('.gps-sync-btn');
+                const btn = document.querySelector('.gps-sync-action-btn');
                 btn.innerText = "📍 LOCATING...";
 
                 const pushLocation = (lat, lon, label) => {
@@ -846,16 +1180,14 @@ def render_map():
                 if (navigator.geolocation) {
                     navigator.geolocation.getCurrentPosition(
                         (pos) => {
-                            pushLocation(pos.coords.latitude, pos.coords.longitude, "GPS LOCKED");
+                            pushLocation(pos.coords.latitude, pos.coords.longitude, "LOCKED");
                         },
                         (err) => {
-                            console.warn("Browser GPS blocked, falling back to IP Geolocation:", err.message);
-                            // Fallback: IP-based lookup for Amman
                             fetch('https://ipapi.co/json/')
                                 .then(res => res.json())
                                 .then(data => {
                                     if (data && data.latitude && data.longitude) {
-                                        pushLocation(data.latitude, data.longitude, "IP LOC LOCKED");
+                                        pushLocation(data.latitude, data.longitude, "IP LOCKED");
                                     } else {
                                         btn.innerText = "❌ GPS BLOCKED";
                                     }
@@ -913,8 +1245,25 @@ def render_map():
                 document.getElementById('stat-breaches').innerText = breachCount;
 
                 const feed = document.getElementById('feed-container');
-                if (feed.innerHTML.includes("Monitoring active vehicle")) {
+                if (feed.innerHTML.includes("Awaiting cabin telemetry")) {
                     feed.innerHTML = "";
+                }
+
+                const confPercent = Math.min(100, Math.max(0, Math.round((alert.confidence || 0.85) * 100)));
+                let readableTime = "Just now";
+                if (alert.timestamp && alert.timestamp !== "Just now") {
+                    try {
+                        const parsedDate = new Date(alert.timestamp);
+                        if (!isNaN(parsedDate.getTime())) {
+                            readableTime = parsedDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        } else {
+                            readableTime = alert.timestamp;
+                        }
+                    } catch (e) {
+                        readableTime = alert.timestamp;
+                    }
+                } else {
+                    readableTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 }
 
                 const card = document.createElement('div');
@@ -927,11 +1276,11 @@ def render_map():
                         </span>
                     </div>
                     <div class="card-body">
-                        ${alert.details || 'Cabin status logged.'}
+                        ${alert.details || 'Cabin status verified by PetraRide KIDDOGO engine.'}
                     </div>
                     <div class="card-footer">
-                        <span>CONFIDENCE: ${(alert.confidence * 100).toFixed(0)}%</span>
-                        <span>${alert.timestamp || 'Just now'}</span>
+                        <span style="font-weight: 700; color: ${isBreach ? '#F87171' : '#34D399'};">⚡ AI CONFIDENCE: ${confPercent}%</span>
+                        <span style="font-family: var(--font-mono); font-weight: 600; color: #94A3B8;">🕒 ${readableTime}</span>
                     </div>
                 `;
 
@@ -981,6 +1330,613 @@ def render_map():
                 el.style.color = "#EF4444";
                 document.getElementById('conn-status').innerText = "Offline";
             };
+        </script>
+    </body>
+    </html>
+    """
+
+# --- PARENT LIVE GUARDIAN PORTAL ---
+@app.get("/parent/{trip_id}", response_class=HTMLResponse)
+def render_parent_portal(trip_id: str):
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>PetraRide KIDDOGO • Live Family Guardian ({trip_id})</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+        
+        <style>
+            :root {{
+                --bg-main: #07090E;
+                --bg-card: #0F1422;
+                --bg-card-inner: #151C30;
+                --bg-glass: rgba(15, 20, 34, 0.92);
+                --border-subtle: rgba(255, 255, 255, 0.08);
+                --border-accent: rgba(14, 165, 233, 0.35);
+                --brand-cyan: #0EA5E9;
+                --brand-emerald: #10B981;
+                --brand-ruby: #EF4444;
+                --text-main: #F8FAFC;
+                --text-muted: #94A3B8;
+                --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                --font-mono: 'JetBrains Mono', monospace;
+            }}
+
+            * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }}
+            html, body {{
+                height: 100%;
+                width: 100%;
+                font-family: var(--font-sans);
+                background: var(--bg-main);
+                color: var(--text-main);
+                overflow: hidden;
+            }}
+
+            body {{
+                display: flex;
+                flex-direction: row;
+            }}
+
+            #parent-map {{
+                flex: 1;
+                height: 100vh;
+                background: #040609;
+                z-index: 1;
+            }}
+
+            #parent-sidebar {{
+                width: 440px;
+                max-width: 100vw;
+                height: 100vh;
+                background: var(--bg-glass);
+                backdrop-filter: blur(20px);
+                border-right: 1px solid var(--border-subtle);
+                display: flex;
+                flex-direction: column;
+                z-index: 1000;
+                box-shadow: 12px 0 40px rgba(0, 0, 0, 0.65);
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+            }}
+
+            #parent-sidebar::-webkit-scrollbar {{
+                width: 4px;
+            }}
+            #parent-sidebar::-webkit-scrollbar-thumb {{
+                background: #1E293B;
+                border-radius: 4px;
+            }}
+
+            .parent-header {{
+                padding: 20px 22px 16px 22px;
+                border-bottom: 1px solid var(--border-subtle);
+                background: rgba(10, 14, 24, 0.96);
+            }}
+
+            .brand-line {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                margin-bottom: 6px;
+            }}
+
+            .brand-logo-wrap {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+
+            .brand-shield-icon {{
+                background: linear-gradient(135deg, #0284C7 0%, #0EA5E9 100%);
+                width: 32px;
+                height: 32px;
+                border-radius: 9px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 15px;
+                box-shadow: 0 4px 12px rgba(14, 165, 233, 0.35);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }}
+
+            .brand-name-wrap h1 {{
+                font-size: 16px;
+                font-weight: 900;
+                letter-spacing: -0.3px;
+                color: #FFFFFF;
+                line-height: 1.1;
+            }}
+
+            .brand-name-wrap h1 .kiddogo-tag {{
+                color: #38BDF8;
+                font-weight: 900;
+            }}
+
+            .brand-name-wrap p {{
+                font-size: 9.5px;
+                font-weight: 700;
+                color: var(--text-muted);
+                letter-spacing: 0.6px;
+                text-transform: uppercase;
+                margin-top: 2px;
+            }}
+
+            .status-chip {{
+                background: rgba(16, 185, 129, 0.12);
+                border: 1px solid rgba(16, 185, 129, 0.3);
+                color: var(--brand-emerald);
+                font-size: 10.5px;
+                font-weight: 800;
+                padding: 4px 10px;
+                border-radius: 999px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                white-space: nowrap;
+            }}
+
+            .pulse-dot {{
+                width: 6px;
+                height: 6px;
+                background: var(--brand-emerald);
+                border-radius: 50%;
+                box-shadow: 0 0 8px var(--brand-emerald);
+                animation: pulse-dot 1.8s infinite;
+            }}
+
+            .child-status-card {{
+                margin: 16px 20px 0 20px;
+                background: linear-gradient(180deg, rgba(14, 165, 233, 0.12) 0%, rgba(15, 20, 34, 0.7) 100%);
+                border: 1px solid var(--border-accent);
+                border-radius: 16px;
+                padding: 16px;
+            }}
+
+            .child-status-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+            }}
+
+            .child-name {{
+                font-size: 14.5px;
+                font-weight: 800;
+                color: #FFFFFF;
+            }}
+
+            .child-shield-tag {{
+                font-size: 9px;
+                font-weight: 800;
+                color: #38BDF8;
+                background: rgba(14, 165, 233, 0.2);
+                padding: 3px 8px;
+                border-radius: 6px;
+                border: 1px solid rgba(14, 165, 233, 0.35);
+            }}
+
+            .child-status-sub {{
+                font-size: 11px;
+                color: #BAE6FD;
+                line-height: 1.45;
+            }}
+
+            .telemetry-row {{
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 8px;
+                margin-top: 12px;
+            }}
+
+            .telemetry-box {{
+                background: var(--bg-card-inner);
+                border: 1px solid var(--border-subtle);
+                border-radius: 10px;
+                padding: 8px 10px;
+                text-align: center;
+            }}
+
+            .telemetry-box .num {{
+                font-family: var(--font-mono);
+                font-size: 13.5px;
+                font-weight: 800;
+                color: #FFFFFF;
+            }}
+
+            .telemetry-box .lbl {{
+                font-size: 8.5px;
+                font-weight: 800;
+                color: var(--text-muted);
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-top: 2px;
+            }}
+
+            .captain-card {{
+                margin: 12px 20px;
+                background: var(--bg-card);
+                border: 1px solid var(--border-subtle);
+                border-radius: 14px;
+                padding: 12px 14px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+            }}
+
+            .captain-details {{
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                min-width: 0;
+            }}
+
+            .captain-avatar {{
+                width: 38px;
+                height: 38px;
+                border-radius: 11px;
+                background: #182338;
+                border: 1.5px solid var(--brand-cyan);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: 800;
+                color: #38BDF8;
+                font-size: 13.5px;
+                flex-shrink: 0;
+            }}
+
+            .captain-info {{
+                min-width: 0;
+            }}
+
+            .captain-info h4 {{
+                font-size: 12.5px;
+                font-weight: 800;
+                color: #FFFFFF;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }}
+
+            .captain-info p {{
+                font-size: 10.5px;
+                color: var(--text-muted);
+                margin-top: 2px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }}
+
+            .call-btn {{
+                background: rgba(16, 185, 129, 0.15);
+                border: 1px solid rgba(16, 185, 129, 0.35);
+                color: var(--brand-emerald);
+                font-family: var(--font-sans);
+                font-size: 11px;
+                font-weight: 800;
+                padding: 7px 12px;
+                border-radius: 8px;
+                cursor: pointer;
+                text-decoration: none;
+                transition: all 0.2s ease;
+                white-space: nowrap;
+                flex-shrink: 0;
+            }}
+
+            .call-btn:hover {{
+                background: rgba(16, 185, 129, 0.28);
+                transform: translateY(-1px);
+            }}
+
+            .section-title {{
+                padding: 12px 22px 6px 22px;
+                font-size: 10.5px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+                color: var(--text-muted);
+            }}
+
+            .timeline-container {{
+                padding: 0 22px 16px 22px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }}
+
+            .timeline-step {{
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                position: relative;
+            }}
+
+            .timeline-step::before {{
+                content: '';
+                position: absolute;
+                left: 11px;
+                top: 22px;
+                bottom: -12px;
+                width: 2px;
+                background: var(--border-subtle);
+            }}
+
+            .timeline-step:last-child::before {{
+                display: none;
+            }}
+
+            .step-dot {{
+                width: 24px;
+                height: 24px;
+                border-radius: 50%;
+                background: #182338;
+                border: 2px solid var(--border-subtle);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 10px;
+                font-weight: 800;
+                z-index: 2;
+                color: var(--text-muted);
+            }}
+
+            .step-dot.active {{
+                background: var(--brand-cyan);
+                border-color: #FFFFFF;
+                color: #FFFFFF;
+                box-shadow: 0 0 10px var(--brand-cyan);
+            }}
+
+            .step-dot.done {{
+                background: var(--brand-emerald);
+                border-color: #FFFFFF;
+                color: #FFFFFF;
+            }}
+
+            .step-meta h5 {{
+                font-size: 12px;
+                font-weight: 800;
+                color: #FFFFFF;
+            }}
+
+            .step-meta p {{
+                font-size: 10px;
+                color: var(--text-muted);
+                margin-top: 1px;
+            }}
+
+            .parent-footer {{
+                margin-top: auto;
+                padding: 16px 20px;
+                border-top: 1px solid var(--border-subtle);
+                background: rgba(10, 14, 24, 0.96);
+            }}
+
+            .emergency-action-btn {{
+                display: block;
+                width: 100%;
+                text-align: center;
+                background: rgba(239, 68, 68, 0.15);
+                border: 1px solid rgba(239, 68, 68, 0.45);
+                color: #F87171;
+                font-size: 12px;
+                font-weight: 800;
+                padding: 12px;
+                border-radius: 10px;
+                text-decoration: none;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                letter-spacing: 0.4px;
+            }}
+
+            .emergency-action-btn:hover {{
+                background: rgba(239, 68, 68, 0.28);
+            }}
+
+            @media (max-width: 840px) {{
+                body {{
+                    flex-direction: column-reverse;
+                }}
+                #parent-sidebar {{
+                    width: 100%;
+                    height: 54vh;
+                    border-right: none;
+                    border-top: 1px solid var(--border-subtle);
+                    border-radius: 22px 22px 0 0;
+                    box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.7);
+                }}
+                #parent-map {{
+                    flex: 1;
+                    height: 46vh;
+                }}
+                .parent-header {{
+                    padding: 12px 18px;
+                }}
+                .child-status-card {{
+                    margin: 10px 18px 0 18px;
+                    padding: 12px;
+                }}
+                .captain-card {{
+                    margin: 10px 18px;
+                    padding: 10px;
+                }}
+                .timeline-container {{
+                    padding: 0 18px 12px 18px;
+                }}
+                .parent-footer {{
+                    padding: 12px 18px;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <aside id="parent-sidebar">
+            <div class="parent-header">
+                <div class="brand-line">
+                    <div class="brand-logo-wrap">
+                        <div class="brand-shield-icon">🛡️</div>
+                        <div class="brand-name-wrap">
+                            <h1>PetraRide <span class="kiddogo-tag">KIDDOGO</span></h1>
+                            <p>Live Family Guardian</p>
+                        </div>
+                    </div>
+                    <div class="status-chip">
+                        <span class="pulse-dot"></span>
+                        <span>Trip {trip_id}</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="child-status-card">
+                <div class="child-status-header">
+                    <div class="child-name">Passenger: Ahmad (أحمد)</div>
+                    <div class="child-shield-tag">🛡️ BIOMETRIC SHIELD ON</div>
+                </div>
+                <p class="child-status-sub">
+                    Biometric voice verified. Trajectory, speed and cabin acoustics monitored continuously.
+                </p>
+
+                <div class="telemetry-row">
+                    <div class="telemetry-box">
+                        <div id="p-speed" class="num">0 km/h</div>
+                        <div class="lbl">Live Speed</div>
+                    </div>
+                    <div class="telemetry-box">
+                        <div id="p-battery" class="num">98%</div>
+                        <div class="lbl">Battery</div>
+                    </div>
+                    <div class="telemetry-box">
+                        <div id="p-route" class="num" style="color: var(--brand-emerald);">ON ROUTE</div>
+                        <div class="lbl">Safe Corridor</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="captain-card">
+                <div class="captain-details">
+                    <div class="captain-avatar">AZ</div>
+                    <div class="captain-info">
+                        <h4>Captain Ahmad Al-Zoubi</h4>
+                        <p>Kia Niro • 24-81923 • ★ 4.98 Certified</p>
+                    </div>
+                </div>
+                <a href="tel:+962790000000" class="call-btn">📞 CALL</a>
+            </div>
+
+            <div class="section-title">Trip Progression & Milestones</div>
+            <div class="timeline-container">
+                <div class="timeline-step">
+                    <div class="step-dot done">✓</div>
+                    <div class="step-meta">
+                        <h5>King Hussein Business Park</h5>
+                        <p>Boarded safely at 08:15 AM</p>
+                    </div>
+                </div>
+                <div class="timeline-step">
+                    <div class="step-dot active">●</div>
+                    <div class="step-meta">
+                        <h5>Mecca Street Safe Corridor</h5>
+                        <p>In transit • Trajectory Nominal</p>
+                    </div>
+                </div>
+                <div class="timeline-step">
+                    <div class="step-dot">3</div>
+                    <div class="step-meta">
+                        <h5>7th Circle Intersection</h5>
+                        <p>Expected in ~4 mins</p>
+                    </div>
+                </div>
+                <div class="timeline-step">
+                    <div class="step-dot">4</div>
+                    <div class="step-meta">
+                        <h5>Destination: Abdoun Circle</h5>
+                        <p>Estimated arrival: 08:35 AM</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="parent-footer">
+                <a href="tel:+96265000000" class="emergency-action-btn">
+                    🚨 24/7 PETRA FAMILY SAFETY HOTLINE
+                </a>
+            </div>
+        </aside>
+
+        <main id="parent-map"></main>
+
+        <script>
+            let currentLat = 31.9715;
+            let currentLon = 35.8354;
+
+            const map = L.map('parent-map', {{ zoomControl: false }}).setView([currentLat, currentLon], 15);
+            L.control.zoom({{ position: 'bottomright' }}).addTo(map);
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19 }}).addTo(map);
+
+            const trail = L.polyline([], {{
+                color: '#0EA5E9',
+                weight: 4,
+                opacity: 0.85,
+                dashArray: '6, 8'
+            }}).addTo(map);
+
+            const vehicleMarker = L.circleMarker([currentLat, currentLon], {{
+                radius: 9,
+                fillColor: '#0EA5E9',
+                color: '#FFFFFF',
+                weight: 2.5,
+                fillOpacity: 1.0
+            }}).addTo(map);
+
+            vehicleMarker.bindPopup("<b>Ahmad's SafeTrack Ride</b><br>Trip {trip_id}");
+
+            function onLocationUpdate(data) {{
+                const lat = data.latitude;
+                const lon = data.longitude;
+                const speed = Math.round((data.speed || 0) * 3.6);
+
+                document.getElementById('p-speed').innerText = speed + " km/h";
+                if (data.battery_level !== undefined) {{
+                    document.getElementById('p-battery').innerText = Math.round(data.battery_level) + "%";
+                }}
+                if (data.route_status) {{
+                    const el = document.getElementById('p-route');
+                    el.innerText = data.route_status;
+                    el.style.color = data.route_status === "ON_ROUTE" ? "var(--brand-emerald)" : "var(--brand-ruby)";
+                }}
+
+                vehicleMarker.setLatLng([lat, lon]);
+                trail.addLatLng([lat, lon]);
+                map.panTo([lat, lon], {{ animate: true, duration: 0.8 }});
+            }}
+
+            fetch('/api/telemetry/current')
+                .then(r => r.json())
+                .then(data => {{
+                    if (data && data.latitude) {{
+                        onLocationUpdate(data);
+                        map.setView([data.latitude, data.longitude], 15);
+                    }}
+                }})
+                .catch(() => {{}});
+
+            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
+            ws.onmessage = (e) => {{
+                try {{
+                    const packet = JSON.parse(e.data);
+                    if (packet.type === "LOCATION_TELEMETRY") {{
+                        onLocationUpdate(packet);
+                    }}
+                }} catch (err) {{}}
+            }};
         </script>
     </body>
     </html>

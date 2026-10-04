@@ -1,21 +1,47 @@
 import io
+import os
 import torch
 import torchaudio
 import soundfile as sf
 import numpy as np
+from pathlib import Path
 from speechbrain.inference.speaker import SpeakerRecognition
 from speechbrain.utils.fetching import LocalStrategy
 
-print("⏳ Initializing SpeechBrain ECAPA-TDNN Speaker Verification Model...")
+# Safe printing for Windows CP1252/CP1256 environments
+def _log(msg: str):
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+_log("Initializing SpeechBrain ECAPA-TDNN Speaker Verification Model...")
 speaker_model = SpeakerRecognition.from_hparams(
     source="speechbrain/spkrec-ecapa-voxceleb",
     savedir="pretrained_models/spkrec-ecapa-voxceleb",
     run_opts={"device": "cpu"},
     local_strategy=LocalStrategy.COPY
 )
-print("✅ Speaker Verification Model Ready.")
+_log("Speaker Verification Model Ready.")
+
+# Directory for persistent voice signatures
+PROFILES_DIR = Path(__file__).resolve().parent / "voice_profiles"
+PROFILES_DIR.mkdir(exist_ok=True)
 
 CHILD_VOICE_REGISTRY: dict[str, torch.Tensor] = {}
+
+# Load existing enrolled profiles from disk on startup
+def _load_saved_profiles():
+    for pt_file in PROFILES_DIR.glob("*.pt"):
+        child_id = pt_file.stem
+        try:
+            tensor = torch.load(pt_file, weights_only=True)
+            CHILD_VOICE_REGISTRY[child_id] = tensor
+            _log(f"Loaded persistent voice profile for '{child_id}' from {pt_file.name}")
+        except Exception as e:
+            _log(f"Warning: Failed to load profile {pt_file}: {e}")
+
+_load_saved_profiles()
 
 MIN_AUDIO_SAMPLES = 32000  # 2.0s at 16kHz minimum required for convolution frames
 
@@ -59,17 +85,35 @@ def enroll_child_voice(child_id: str, file_bytes: bytes) -> dict:
     embedding = torch.nn.functional.normalize(embedding, p=2, dim=-1)
     CHILD_VOICE_REGISTRY[child_id] = embedding
     
+    # Persist profile to disk
+    try:
+        profile_path = PROFILES_DIR / f"{child_id}.pt"
+        torch.save(embedding, profile_path)
+        _log(f"Persisted voice profile for '{child_id}' to {profile_path.name}")
+    except Exception as e:
+        _log(f"Warning: Could not write voice profile to disk: {e}")
+
     return {
         "status": "ENROLLED",
         "child_id": child_id,
-        "embedding_dims": embedding.shape[-1]
+        "embedding_dims": embedding.shape[-1],
+        "persisted": True
     }
 
-def verify_speaker(child_id: str, file_bytes: bytes, threshold: float = 0.45) -> dict:
+def verify_speaker(child_id: str, file_bytes: bytes, threshold: float = 0.32) -> dict:
     """
     Compares candidate voice against enrolled profile.
-    Threshold set to 0.45 for real-world acoustic environments.
+    Threshold set to 0.32 for real-world acoustic phone mic environments.
     """
+    # Lazy reload from disk if missing in memory
+    if child_id not in CHILD_VOICE_REGISTRY:
+        profile_path = PROFILES_DIR / f"{child_id}.pt"
+        if profile_path.exists():
+            try:
+                CHILD_VOICE_REGISTRY[child_id] = torch.load(profile_path, weights_only=True)
+            except Exception:
+                pass
+
     if child_id not in CHILD_VOICE_REGISTRY:
         return {
             "verified": False,

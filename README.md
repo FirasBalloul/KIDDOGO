@@ -2,7 +2,7 @@
 
 KIDDOGO is a child-safety layer built for PetraRide, a Jordan-based ride platform focused on safer travel for children. The project adds monitoring and escalation features for family rides, and other journeys where a child may be traveling without a guardian present.
 
-The system combines on-device audio detection, voice-based identity checks, live GPS telemetry, and a rider companion flow to help detect real distress early while avoiding unnecessary alarms for normal rides.
+The system combines on-device audio detection, voice-based identity checks, live GPS telemetry, a rider companion flow, and an optional cabin pose sentinel. It is a prototype and should not be relied on as the sole means of protecting a passenger.
 
 ---
 
@@ -13,9 +13,13 @@ The system combines on-device audio detection, voice-based identity checks, live
 - opens a safety confirmation flow when a distress pattern is detected
 - verifies the rider’s voice before suppressing or escalating the alert
 - blocks unauthorized voice attempts and triggers a higher-priority escalation
-- sends live GPS updates to a FastAPI backend
+- sends live GPS, vehicle speed, G-force kinematics, and battery health to a FastAPI backend
+- detects route corridor deviations and prolonged unplanned stops
+- supports **Push-to-Talk voice notes** in the PetraBuddy companion chat
 - streams alert and location data to an operations map at `/map`
-- includes a companion chat flow for the rider with SOS support
+- provides a dedicated **Parent Live Guardian Portal** at `/parent/{trip_id}`
+- optionally checks cabin wrist position against a virtual boundary using MediaPipe Pose
+- correlates audio, vision, and G-force kinematic events in a multi-modal fusion window
 
 ---
 
@@ -27,25 +31,28 @@ Mobile app (React Native / Expo)
     ├─ microphone audio stream
     ├─ YAMNet TFLite inference (on-device)
     ├─ voice enrollment / verification
-    ├─ live GPS telemetry
-    └─ PetraBuddy companion chat + SOS flow
+    ├─ live GPS & G-Force kinematics stream
+    ├─ offline store-and-forward queue
+    └─ PetraBuddy companion chat (Push-to-Talk + SOS)
             │
             ▼
 FastAPI backend
     │
-    ├─ /api/telemetry/location
+    ├─ /api/telemetry/location (Corridor + Kinematics)
     ├─ /api/alerts
-    ├─ /api/voice/enroll
+    ├─ /api/voice/enroll (Persistent on-disk storage)
     ├─ /api/voice/verify
-    ├─ WebSocket updates for the dashboard
-    └─ Gemini triage response when available
+    ├─ /api/voice/status/{child_id}
+    ├─ /api/companion/chat & /api/companion/chat-voice
+    ├─ /api/incident/boundary-breach
+    ├─ multi-modal fusion engine (Vision + Audio + Kinematics)
+    ├─ WebSocket updates for live dashboards
+    └─ Gemini multimodal triage and chat responses
             │
-            ▼
-Operations dashboard (/map)
-    ├─ live map marker
-    ├─ speed / coord telemetry
-    ├─ incident feed
-    └─ alert status updates
+            ├───────────────┬───────────────┐
+            ▼               ▼               ▼
+      Operations Map   Parent Portal   SQLite / Postgres
+         (/map)       (/parent/{id})       (Resilient)
 ```
 
 ---
@@ -66,15 +73,15 @@ The project includes a threshold-based escalation flow:
 
 The backend uses SpeechBrain ECAPA-TDNN embeddings to enroll and validate a child’s voice profile.
 
-The flow in the app is roughly:
+The flow in the app is:
 
-- enroll voice by recording a short sample
-- store the voice embedding for `child_01`
-- during a distress event, ask the user to confirm safety by speaking
-- compare the recorded sample to the enrolled profile
-- reject or escalate if the voice is not recognized
+- enroll voice by recording a short 4-second sample
+- persist voice embeddings on disk (`backend/voice_profiles/{child_id}.pt`) for automatic reload across server restarts
+- during a distress event, ask the user to confirm safety by speaking ("I am safe")
+- compare the recorded sample against the enrolled biometric embedding (cosine similarity threshold >= 0.32)
+- reject or escalate if the voice is not recognized (Anti-Impostor Shield)
 
-This is the main anti-coercion mechanism in the project.
+This ensures that third-party driver attempts to silence a child's distress alert are blocked. Voice check audio is verified via SpeechBrain; after a speaker match, the backend also sends the audio to Gemini for situation triage if configured.
 
 ### 3. Safety check-in loop
 
@@ -82,10 +89,12 @@ When an event is detected, the app opens a short countdown and asks the rider wh
 
 Possible outcomes:
 
-- safe confirmation: suppress the alert
+- verified safe confirmation: suppress the alert
 - no response: escalate
 - voice mismatch: `IMPOSTOR_BLOCKED`
 - manual SOS: `MANUAL_SOS`
+
+Voice verification is optional in the current UI: if no voice profile is enrolled, tapping the safe-confirmation button resolves the check-in without verifying identity. A voice verification request error also currently resolves as safe; this is a prototype limitation.
 
 ### 4. Companion chat and SOS
 
@@ -111,6 +120,16 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 
 ---
 
+### 6. Optional cabin spatial sentinel
+
+Run `backend/cabin_sentinel.py` separately from the API to use a connected camera. It uses OpenCV and MediaPipe Pose to estimate body landmarks locally, then checks whether a sufficiently visible wrist landmark crosses the configured image midpoint. When it detects a breach, it posts an incident to `/api/incident/boundary-breach`. The display uses a synthetic pose visualization rather than showing the camera frame.
+
+This is a simple image-space boundary check; it does not identify people or understand intent. Camera orientation, placement, and calibration affect which side of the frame represents each cabin zone.
+
+The backend fusion engine correlates audio and vision observations in a short sliding time window. Location updates also record vehicle speed, but the current telemetry path does not provide acceleration or braking measurements to score a kinematic event. This logic is experimental and is not a validated emergency detector.
+
+---
+
 ## Tech stack
 
 ### Mobile app
@@ -128,9 +147,10 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 - FastAPI
 - Python
 - SQLAlchemy
-- SQLite
+- PostgreSQL
 - Google Gemini SDK
 - SpeechBrain
+- MediaPipe Pose and OpenCV (optional camera sentinel)
 - WebSockets
 
 ### Operations UI
@@ -147,6 +167,8 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 .
 ├── backend/
 │   ├── database.py
+│   ├── cabin_sentinel.py
+│   ├── fusion_engine.py
 │   ├── main.py
 │   ├── models.py
 │   ├── requirements.txt
@@ -158,7 +180,8 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 │   ├── android/
 │   ├── app.json
 │   ├── assets/
-│   │   └── yamnet.tflite
+│   │   ├── yamnet.tflite
+│   │   └── yamnet_class_map.csv
 │   ├── package.json
 │   └── src/
 │       ├── app/
@@ -166,9 +189,13 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 │       └── components/
 │           └── CompanionChatModal.tsx
 │
+├── ai-models/
+│   ├── test_yamnet.py
+│   ├── yamnet.tflite
+│   └── yamnet_class_map.csv
+│
 ├── README.md
-├── docker-compose.yml
-└── ai-models/
+└── docker-compose.yml
 ```
 
 ---
@@ -178,11 +205,14 @@ The backend then broadcasts the position to connected clients via WebSocket and 
 The FastAPI backend exposes the following main endpoints:
 
 - `GET /` — health check
+- `GET /api/telemetry/current` — gets the latest cached location and speed
 - `POST /api/telemetry/location` — receives live GPS updates
 - `POST /api/alerts` — stores and broadcasts an incident alert
-- `GET /api/alerts` — returns recent alerts
+- `GET /api/alerts` — returns the latest stored alerts
 - `POST /api/voice/enroll` — enrolls a child voice profile
-- `POST /api/voice/verify` — verifies the rider voice and returns triage info
+- `POST /api/voice/verify` — checks the speaker and returns triage information
+- `POST /api/companion/chat` — returns a companion response and escalates detected concerns
+- `POST /api/incident/boundary-breach` — records a spatial boundary incident
 - `GET /map` — renders the operations dashboard
 - `WebSocket /ws` — streams live events to the frontend
 
@@ -192,17 +222,44 @@ The FastAPI backend exposes the following main endpoints:
 
 ### 1. Backend
 
-```bash
+From the repository root, create and activate a virtual environment, then install the backend requirements:
+
+```powershell
 cd backend
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
 
-# create a .env file with your key
-# GEMINI_API_KEY=your_key_here
+The backend uses PostgreSQL. Start or configure a PostgreSQL server before launching it. To use the included Compose database:
 
+```powershell
+docker compose up -d db
+```
+
+The connection URL in `backend/database.py` and the database name/credentials in `docker-compose.yml` must match. Reconcile those settings before starting the API.
+
+Create `backend/.env` to enable Gemini-backed triage and companion responses:
+
+```env
+GEMINI_API_KEY=your_key_here
+```
+
+Start the API from the `backend` directory:
+
+```powershell
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+To run the optional camera sentinel, open another terminal, activate the same environment, and run:
+
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
+python cabin_sentinel.py
+```
+
+The sentinel needs camera access. Its alert URL defaults to `http://127.0.0.1:8000`; change `BACKEND_ALERT_URL` in `cabin_sentinel.py` if the API runs on another host.
 
 Then open:
 
@@ -211,19 +268,17 @@ Then open:
 
 ### 2. Mobile app
 
-```bash
+```powershell
 cd mobile
 npm install
 npx expo start --clear
 ```
 
-The app uses a hardcoded backend URL in the mobile client, so this usually needs to be updated to the machine running the backend:
+The mobile client currently has a hardcoded backend URL in `mobile/src/app/index.tsx`. Update `BACKEND_URL` to a host reachable from the device. For a physical phone, use the computer's LAN IP; `localhost` on the phone refers to the phone itself:
 
 ```ts
 const BACKEND_URL = 'http://<YOUR_LOCAL_IP>:8000';
 ```
-
-This is in `mobile/src/app/index.tsx`.
 
 ---
 
@@ -242,14 +297,17 @@ This is in `mobile/src/app/index.tsx`.
 ## Notes and limitations
 
 - This project is a prototype, not a production-grade safety system.
-- The app expects Android hardware for testing and microphone access.
-- The backend and mobile client are configured for a local network setup, not a public deployment.
+- The mobile client needs microphone and location permissions. Physical-device testing requires a backend reachable over the local network.
+- Public deployment, production security, and other platform support are not covered by this prototype setup.
 - The mapping dashboard and alert feed are intended for demonstration and operational visibility during a trip.
 - The YAMNet model is used as a first-stage signal, not a complete diagnostic system.
+- Enrolled voice embeddings are persisted to disk as `.pt` PyTorch tensors in `backend/voice_profiles/` for seamless persistence across server restarts.
+- Gemini features require `GEMINI_API_KEY`. If Gemini is unavailable, the backend uses built-in fallback responses for voice triage and companion chat.
+- The PostgreSQL database runs via Docker Compose or local PostgreSQL with automatic SQLite fallback.
+- Kinematic telemetry calculates real-time G-force deltas and vehicle velocity to correlate sudden braking/swerves with acoustic events in the multi-modal fusion window.
 
 ---
 
 ## Summary
 
 PetraKids SafeTrack is a proof-of-concept child-rider safety stack built around anomaly detection, voice verification, and operational awareness. The core value is not just GPS tracking — it is filtering out noise, validating the actual rider, and escalating only when the evidence supports it.
-

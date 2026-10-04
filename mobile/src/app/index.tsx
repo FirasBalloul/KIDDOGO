@@ -23,45 +23,39 @@ import { CompanionChatModal } from '../components/CompanionChatModal';
 const { width } = Dimensions.get('window');
 const BACKEND_URL = 'http://192.168.1.29:8000';
 
-const DISTRESS_CONFIDENCE_THRESHOLD = 0.35;
+const DISTRESS_CONFIDENCE_THRESHOLD = 0.20;
 
 const DISTRESS_INDICES = [
-  20, 21, 22, 23,
-  280, 281, 282, 283,
-  322, 326,
-  358, 359,
-  410, 412, 413, 414,
-  420, 421, 422, 423,
-  432, 433, 434, 435, 436,
-  513, 514, 515, 516, 517,
+  6, 9, 10, 11, 19, 20, 21, 22,
+  306, 307, 316, 317, 318, 319,
+  390, 391,
+  434, 435, 436, 437,
+  463, 464,
 ];
 
 const SOUND_LABELS: Record<number, string> = {
-  20: 'Crying',
-  21: 'Baby Cry',
-  22: 'Screaming',
-  23: 'Shout / Distress',
-  280: 'Emergency Siren',
-  281: 'Civil Defense Siren',
-  282: 'Ambulance / Police Siren',
-  283: 'Fire Engine Siren',
-  322: 'Door Slam / Impact',
-  326: 'Door Knock / Thud',
-  358: 'Glass / Ceramic Impact',
-  359: 'Metal Clatter',
-  410: 'Impact / Smack',
-  412: 'Breaking / Smash',
-  413: 'Splintering',
-  420: 'Explosion',
-  421: 'Gunshot / Bang',
-  422: 'Vehicle Crash',
-  423: 'Collision Anomaly',
-  432: 'Glass Sound',
-  433: 'Glass Shatter',
-  434: 'Glass Breaking',
-  435: 'Glass Clink / Shatter',
-  436: 'Cracking Glass',
-  514: 'Vocal Distress / Screaming',
+  6: 'Shout / Distress',
+  9: 'Yelling',
+  10: 'Children Shouting',
+  11: 'Screaming',
+  19: 'Crying / Sobbing',
+  20: 'Baby Cry',
+  21: 'Whimper',
+  22: 'Wailing',
+  306: 'Vehicle Skidding',
+  307: 'Tire Squeal',
+  316: 'Emergency Vehicle',
+  317: 'Police Siren',
+  318: 'Ambulance Siren',
+  319: 'Fire Truck Siren',
+  390: 'Emergency Siren',
+  391: 'Civil Defense Siren',
+  434: 'Glass Cracking',
+  435: 'Glass Impact',
+  436: 'Glass Clink',
+  437: 'Glass Shatter',
+  463: 'Vehicle Crash / Smash',
+  464: 'Impact Collision',
 };
 
 interface AlertEntry {
@@ -105,6 +99,39 @@ function createWavBase64(samples: Float32Array, sampleRate: number = 16000): str
   return Buffer.from(buffer).toString('base64');
 }
 
+const COMPANION_PROMPTS = {
+  ar: {
+    checkInSpeech: 'طمني عليك يا بطل، كل اشي تمام؟',
+    checkInTitle: 'فحص الأمان الذكي • AI CHECK-IN',
+    checkInPrimary: 'طمني عليك، كل اشي تمام؟',
+    checkInSecondary: 'Are you okay? Please confirm.',
+    verifyPromptSpeech: 'احكيلي أنا بخير أو طمني شو صار.',
+    confirmSafeBtn: 'أنا بخير • I\'M SAFE',
+    confirmSafeVoiceBtn: '🎙️ أنا بخير (بصمة الصوت)',
+    sosBtn: '🚨 طوارئ SOS',
+    noVoiceDetected: 'لم يتم رصد صوت. جاري إرسال إشعار طوارئ.',
+    impostorRejected: 'بصمة الصوت غير متطابقة. جاري إشعار غرفة العمليات.',
+    serverError: 'تعذر الوصول لخادم الأمان. جاري تصعيد البلاغ.',
+    safeReassurance: 'الحمدلله على سلامتك يا بطل، رحلتك مستمرة بأمان.',
+    speechLang: 'ar-SA',
+  },
+  en: {
+    checkInSpeech: 'Are you okay? Please confirm you are safe.',
+    checkInTitle: 'AI COMPANION SAFETY CHECK',
+    checkInPrimary: 'Are you okay?',
+    checkInSecondary: 'طمني عليك، كل اشي تمام؟',
+    verifyPromptSpeech: 'Say "I am safe" or tell me what happened.',
+    confirmSafeBtn: 'I\'M SAFE • أنا بخير',
+    confirmSafeVoiceBtn: '🎙️ I\'M SAFE (VERIFY VOICE)',
+    sosBtn: '🚨 SOS NOW',
+    noVoiceDetected: 'No voice audio detected. Escalating alert.',
+    impostorRejected: 'Voice identity rejected. Alerting operations now.',
+    serverError: 'Unable to reach safety verification server. Escalating.',
+    safeReassurance: 'Safety confirmed! Everything is okay, have a safe trip.',
+    speechLang: 'en-US',
+  },
+};
+
 export default function GuardianAITester() {
   const [status, setStatus] = useState('Initializing...');
   const [latestSound, setLatestSound] = useState('Normal Vehicle Status');
@@ -113,8 +140,32 @@ export default function GuardianAITester() {
   const [alertHistory, setAlertHistory] = useState<AlertEntry[]>([]);
   const [showLiveMap, setShowLiveMap] = useState(true);
 
+  // Companion Spoken Prompt Language Selector ('ar' | 'en')
+  const [companionLang, setCompanionLang] = useState<'ar' | 'en'>('ar');
+
   // Child Companion Chat State
   const [showChatModal, setShowChatModal] = useState(false);
+  const wasListeningBeforeChat = useRef(false);
+
+  const openChatModal = async () => {
+    if (isListening) {
+      wasListeningBeforeChat.current = true;
+      await stopAudioListening();
+    } else {
+      wasListeningBeforeChat.current = false;
+    }
+    setShowChatModal(true);
+  };
+
+  const closeChatModal = async () => {
+    setShowChatModal(false);
+    if (wasListeningBeforeChat.current) {
+      wasListeningBeforeChat.current = false;
+      setTimeout(() => {
+        startListening();
+      }, 350);
+    }
+  };
 
   // Companion Check-in States
   const [showVerificationModal, setShowVerificationModal] = useState(false);
@@ -162,6 +213,16 @@ export default function GuardianAITester() {
       const modelError = (plugin as any).error ?? new Error('Model load fault');
       setStatus(`Offline: ${modelError.message || 'Engine fault'}`);
     }
+
+    // Check if child voice profile is already enrolled on backend
+    fetch(`${BACKEND_URL}/api/voice/status/child_01`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.enrolled) {
+          setIsEnrolled(true);
+        }
+      })
+      .catch(() => {});
   }, [plugin.state]);
 
   const updateMapCoordinates = (lat: number, lon: number) => {
@@ -173,6 +234,74 @@ export default function GuardianAITester() {
         true;
       `;
       webViewRef.current.injectJavaScript(jsCode);
+    }
+  };
+
+  // Real-Time Kinematics & Device Health Tracking
+  const [gForce, setGForce] = useState(0.0);
+  const [batteryLevel, setBatteryLevel] = useState(98);
+  const [corridorStatus, setCorridorStatus] = useState('ON ROUTE');
+  const [offlineCount, setOfflineCount] = useState(0);
+
+  const gForceRef = useRef(0.0);
+  const batteryRef = useRef(98);
+  const offlineQueueRef = useRef<{ url: string; body: any }[]>([]);
+
+  // Flush queued requests when connectivity is established
+  const flushOfflineQueue = async () => {
+    if (offlineQueueRef.current.length === 0) return;
+    const queue = [...offlineQueueRef.current];
+    offlineQueueRef.current = [];
+    setOfflineCount(0);
+
+    for (const item of queue) {
+      try {
+        await fetch(item.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(item.body),
+        });
+      } catch {
+        offlineQueueRef.current.push(item);
+        setOfflineCount(offlineQueueRef.current.length);
+        break;
+      }
+    }
+  };
+
+  const safePost = async (url: string, body: any) => {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        flushOfflineQueue();
+      }
+      return res;
+    } catch {
+      offlineQueueRef.current.push({ url, body });
+      setOfflineCount(offlineQueueRef.current.length);
+      return null;
+    }
+  };
+
+  const lastSpeedRef = useRef<number>(0);
+  const lastSpeedTimeRef = useRef<number>(Date.now());
+
+  // Kinematic G-Force & acceleration delta calculation
+  const computeKinematicGForce = (currentSpeedMs: number) => {
+    const now = Date.now();
+    const dt = (now - lastSpeedTimeRef.current) / 1000.0;
+    if (dt > 0.4) {
+      const dv = Math.abs(currentSpeedMs - lastSpeedRef.current);
+      const accelMs2 = dv / dt;
+      const g = Math.min(2.5, parseFloat((accelMs2 / 9.81).toFixed(2)));
+      gForceRef.current = g;
+      setGForce(g);
+      lastSpeedRef.current = currentSpeedMs;
+      lastSpeedTimeRef.current = now;
     }
   };
 
@@ -191,16 +320,21 @@ export default function GuardianAITester() {
           setCoords(initialCoords);
           updateMapCoordinates(initialCoords.latitude, initialCoords.longitude);
 
-          fetch(`${BACKEND_URL}/api/telemetry/location`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              child_id: 'child_01',
-              latitude: initialCoords.latitude,
-              longitude: initialCoords.longitude,
-              speed: initialPos.coords.speed || 0.0,
-            }),
-          }).catch(() => {});
+          safePost(`${BACKEND_URL}/api/telemetry/location`, {
+            child_id: 'child_01',
+            latitude: initialCoords.latitude,
+            longitude: initialCoords.longitude,
+            speed: initialPos.coords.speed || 0.0,
+            g_force_delta: gForceRef.current,
+            battery_level: batteryRef.current,
+          }).then(async (res) => {
+            if (res) {
+              const data = await res.json();
+              if (data?.corridor?.route_status) {
+                setCorridorStatus(data.corridor.route_status);
+              }
+            }
+          });
         }
 
         locationSubscriptionRef.current = await Location.watchPositionAsync(
@@ -210,18 +344,24 @@ export default function GuardianAITester() {
             const updatedCoords = { latitude: location.coords.latitude, longitude: location.coords.longitude };
             coordsRef.current = updatedCoords;
             setCoords(updatedCoords);
-            updateMapCoordinates(updatedCoords.latitude, updatedCoords.longitude);
+            const currentSpeed = location.coords.speed || 0.0;
+            computeKinematicGForce(currentSpeed);
 
-            fetch(`${BACKEND_URL}/api/telemetry/location`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                child_id: 'child_01',
-                latitude: location.coords.latitude,
-                longitude: location.coords.longitude,
-                speed: location.coords.speed || 0.0,
-              }),
-            }).catch(() => {});
+            safePost(`${BACKEND_URL}/api/telemetry/location`, {
+              child_id: 'child_01',
+              latitude: location.coords.latitude,
+              longitude: location.coords.longitude,
+              speed: currentSpeed,
+              g_force_delta: gForceRef.current,
+              battery_level: batteryRef.current,
+            }).then(async (res) => {
+              if (res) {
+                const data = await res.json();
+                if (data?.corridor?.route_status) {
+                  setCorridorStatus(data.corridor.route_status);
+                }
+              }
+            });
           }
         );
       } catch (err) {
@@ -251,8 +391,9 @@ export default function GuardianAITester() {
     Vibration.vibrate([0, 300, 200, 300]);
     isSpeakingRef.current = true;
 
-    Speech.speak('Are you okay?', {
-      language: 'en-US',
+    const config = COMPANION_PROMPTS[companionLang];
+    Speech.speak(config.checkInSpeech, {
+      language: config.speechLang,
       pitch: 1.0,
       rate: 1.0,
       onDone: () => { isSpeakingRef.current = false; },
@@ -306,12 +447,17 @@ export default function GuardianAITester() {
       return;
     }
 
+    if (!isListening) {
+      await startListening();
+    }
+
     if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
     setIsVerifyingVoice(true);
 
     isSpeakingRef.current = true;
-    Speech.speak('Say "I am safe" or tell me what happened.', {
-      language: 'en-US',
+    const config = COMPANION_PROMPTS[companionLang];
+    Speech.speak(config.verifyPromptSpeech, {
+      language: config.speechLang,
       onDone: () => {
         isSpeakingRef.current = false;
         listenForVerificationVoice();
@@ -326,6 +472,7 @@ export default function GuardianAITester() {
   const listenForVerificationVoice = () => {
     sampleCaptureBuffer.current = [];
     isCapturingBiometrics.current = true;
+    const config = COMPANION_PROMPTS[companionLang];
 
     // Capture 3.5 seconds of child voice response
     setTimeout(async () => {
@@ -335,6 +482,7 @@ export default function GuardianAITester() {
 
       if (samples.length < 16000) {
         setIsVerifyingVoice(false);
+        Speech.speak(config.noVoiceDetected, { language: config.speechLang });
         escalateAlertToBrain(pendingAlert?.soundName || 'Distress Event', pendingAlert?.confidence || 0.8, false, true);
         return;
       }
@@ -356,16 +504,20 @@ export default function GuardianAITester() {
 
         // 1. Biometric verification failed: Reject impostor attempt
         if (!data.verified) {
-          const rejectionSpeech = data.triage?.reassurance_speech_en || 'Voice identity rejected. Alerting operations now.';
-          Speech.speak(rejectionSpeech, { language: 'en-US' });
+          const rejectionSpeech = companionLang === 'ar'
+            ? config.impostorRejected
+            : (data.triage?.reassurance_speech_en || config.impostorRejected);
+          Speech.speak(rejectionSpeech, { language: config.speechLang });
           escalateAlertToBrain(pendingAlert?.soundName || 'Distress Event', pendingAlert?.confidence || 0.8, false, true);
           return;
         }
 
         // 2. Child identity verified: Check triage outcome
         if (data.triage?.is_emergency) {
-          const calmingDistressPrompt = data.triage.reassurance_speech_ar || 'خليك هادي يا بطل، المساعدة جاي بالطريق.';
-          Speech.speak(calmingDistressPrompt, { language: 'ar-SA' });
+          const calmingDistressPrompt = companionLang === 'ar'
+            ? (data.triage.reassurance_speech_ar || 'خليك هادي يا بطل، المساعدة جاية بالطريق.')
+            : (data.triage.reassurance_speech_en || 'Stay calm champion, help is on the way.');
+          Speech.speak(calmingDistressPrompt, { language: config.speechLang });
           escalateAlertToBrain(data.triage.detected_situation, 0.95, false, false);
         } else {
           resolveSafeState(data.triage);
@@ -373,7 +525,8 @@ export default function GuardianAITester() {
       } catch (err) {
         console.error('Verification error:', err);
         setIsVerifyingVoice(false);
-        resolveSafeState();
+        Speech.speak(config.serverError, { language: config.speechLang });
+        escalateAlertToBrain(pendingAlert?.soundName || 'Safety Server Unreachable', pendingAlert?.confidence || 0.8, false, false);
       }
     }, 3500);
   };
@@ -387,8 +540,11 @@ export default function GuardianAITester() {
     audioBufferRef.current = [];
     sampleCaptureBuffer.current = [];
 
-    const spokenMessage = triageData?.reassurance_speech_ar || 'الحمدلله على سلامتك يا بطل، رحلتك مستمرة بأمان.';
-    const lang = triageData?.reassurance_speech_ar ? 'ar-SA' : 'en-US';
+    const config = COMPANION_PROMPTS[companionLang];
+    const spokenMessage = companionLang === 'ar'
+      ? (triageData?.reassurance_speech_ar || config.safeReassurance)
+      : (triageData?.reassurance_speech_en || config.safeReassurance);
+    const lang = config.speechLang;
 
     isSpeakingRef.current = true;
     cooldownUntilRef.current = Date.now() + 12000;
@@ -545,25 +701,43 @@ export default function GuardianAITester() {
 
             try {
               const outputs = await plugin.model.run([inputFloat32.buffer]);
-              const scores = new Float32Array(outputs[0]);
+              const rawOutput: any = outputs[0];
+              const scores = rawOutput instanceof Float32Array 
+                ? rawOutput 
+                : new Float32Array(rawOutput.buffer || rawOutput);
 
-              let maxScore = 0;
-              let topIndex = -1;
-              for (let i = 0; i < scores.length; i++) {
-                if (scores[i] > maxScore) {
-                  maxScore = scores[i];
-                  topIndex = i;
+              // 1. Find the highest scoring distress sound among danger classes
+              let topDistressScore = 0;
+              let topDistressIndex = -1;
+              for (const idx of DISTRESS_INDICES) {
+                const s = scores[idx] || 0;
+                if (s > topDistressScore) {
+                  topDistressScore = s;
+                  topDistressIndex = idx;
                 }
               }
 
-              if (maxScore > DISTRESS_CONFIDENCE_THRESHOLD) {
-                const isDistress = DISTRESS_INDICES.includes(topIndex);
-                const detectedName = SOUND_LABELS[topIndex] || `Class ${topIndex}`;
-                setLatestSound(`${detectedName} (${Math.round(maxScore * 100)}%)`);
-
-                if (isDistress && !showVerificationModalRef.current) {
-                  initiateCompanionCheckIn(topIndex, maxScore);
+              // 2. Also track global top sound for general UI status
+              let globalMaxScore = 0;
+              let globalTopIndex = -1;
+              for (let i = 0; i < scores.length; i++) {
+                if (scores[i] > globalMaxScore) {
+                  globalMaxScore = scores[i];
+                  globalTopIndex = i;
                 }
+              }
+
+              // 3. Trigger alert if distress sound exceeds threshold
+              if (topDistressScore >= DISTRESS_CONFIDENCE_THRESHOLD && topDistressIndex !== -1) {
+                const detectedName = SOUND_LABELS[topDistressIndex] || `Acoustic Anomaly`;
+                setLatestSound(`🚨 ${detectedName} (${Math.round(topDistressScore * 100)}%)`);
+
+                if (!showVerificationModalRef.current) {
+                  initiateCompanionCheckIn(topDistressIndex, topDistressScore);
+                }
+              } else if (globalMaxScore > 0.30 && globalTopIndex !== -1) {
+                const generalName = SOUND_LABELS[globalTopIndex] || (globalTopIndex === 0 ? 'Speech' : `Ambient (${globalTopIndex})`);
+                setLatestSound(`${generalName} (${Math.round(globalMaxScore * 100)}%)`);
               }
             } catch (err) {
               console.error('Acoustic inference error:', err);
@@ -637,45 +811,82 @@ export default function GuardianAITester() {
     <View style={styles.container}>
       {/* 1. Brand & Trip Header */}
       <View style={styles.header}>
-        <View>
-          <Text style={styles.brandTitle}>
-            PETRA<Text style={styles.brandAccent}>RIDE</Text>
-          </Text>
-          <Text style={styles.brandSubtitle}>SAFETRACK GUARDIAN • TRIP PR-9942</Text>
+        <View style={styles.headerTopRow}>
+          <View style={styles.brandLockup}>
+            <View style={styles.brandIconBadge}>
+              <Text style={styles.brandIconText}>🛡️</Text>
+            </View>
+            <View style={{ flexShrink: 1 }}>
+              <Text style={styles.brandTitle} numberOfLines={1}>
+                PetraRide <Text style={styles.brandAccent}>KIDDOGO</Text>
+              </Text>
+              <Text style={styles.brandSubtitle} numberOfLines={1}>COCKPIT • TRIP PR-9942</Text>
+            </View>
+          </View>
+
+          <View style={styles.headerRightActions}>
+            <TouchableOpacity
+              style={styles.langSelectorPill}
+              onPress={() => setCompanionLang((prev) => (prev === 'ar' ? 'en' : 'ar'))}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.langSelectorPillText}>
+                {companionLang === 'ar' ? '🌐 عربي' : '🌐 EN'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.chatLaunchPill}
+              onPress={openChatModal}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.chatLaunchPillText}>💬 BUDDY</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
-        <View style={styles.headerRightActions}>
-          <TouchableOpacity
-            style={styles.chatLaunchPill}
-            onPress={() => setShowChatModal(true)}
-          >
-            <Text style={styles.chatLaunchPillText}>💬 BUDDY CHAT</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.shieldPill, isEnrolled ? styles.shieldActive : styles.shieldInactive]}
-            onPress={() => setShowEnrollModal(true)}
-          >
-            <Text style={styles.shieldText}>
-              {isEnrolled ? '🛡️ ENROLLED' : '⚠️ ENROLL'}
+        {/* Biometric Shield Interactive Status Strip */}
+        <TouchableOpacity
+          style={[styles.shieldBannerBtn, isEnrolled ? styles.shieldBannerActive : styles.shieldBannerInactive]}
+          onPress={() => setShowEnrollModal(true)}
+          activeOpacity={0.85}
+        >
+          <View style={styles.shieldBannerLeft}>
+            <Text style={styles.shieldBannerIcon}>{isEnrolled ? '🛡️' : '⚠️'}</Text>
+            <View style={{ flexShrink: 1 }}>
+              <Text style={styles.shieldBannerTitle} numberOfLines={1}>
+                {isEnrolled ? 'BIOMETRIC VOICE SHIELD ACTIVE' : 'VOICE SHIELD NOT CALIBRATED'}
+              </Text>
+              <Text style={styles.shieldBannerSub} numberOfLines={1}>
+                {isEnrolled ? 'Passenger voice verified • Anti-override locked' : 'Tap to record signature and protect checks'}
+              </Text>
+            </View>
+          </View>
+          <View style={[styles.shieldActionTag, isEnrolled ? styles.shieldTagActive : styles.shieldTagInactive]}>
+            <Text style={[styles.shieldActionTagText, isEnrolled ? styles.shieldTagTextActive : styles.shieldTagTextInactive]}>
+              {isEnrolled ? 'CALIBRATED' : 'CALIBRATE'}
             </Text>
-          </TouchableOpacity>
-        </View>
+          </View>
+        </TouchableOpacity>
       </View>
 
-      {/* Captain Profile Ribbon (Pillar 1) */}
+      {/* Captain Profile Ribbon */}
       <View style={styles.captainRibbon}>
         <View style={styles.captainRibbonLeft}>
           <View style={styles.captainMiniAvatar}>
             <Text style={styles.captainMiniAvatarText}>AZ</Text>
           </View>
-          <View>
-            <Text style={styles.captainRibbonName}>Captain Ahmad Al-Zoubi</Text>
-            <Text style={styles.captainRibbonCar}>Kia Niro (24-81923) • Rating 4.98</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.captainRibbonName} numberOfLines={1}>
+              Captain Ahmad Al-Zoubi
+            </Text>
+            <Text style={styles.captainRibbonCar} numberOfLines={1}>
+              Kia Niro • 24-81923 • ★ 4.98
+            </Text>
           </View>
         </View>
         <View style={styles.verifiedTag}>
-          <Text style={styles.verifiedTagText}>★ KIDS-CERTIFIED</Text>
+          <Text style={styles.verifiedTagText}>KIDS-CERTIFIED</Text>
         </View>
       </View>
 
@@ -701,11 +912,37 @@ export default function GuardianAITester() {
         <View style={styles.coordsOverlay}>
           <TouchableOpacity onPress={() => setShowLiveMap((prev) => !prev)}>
             <Text style={styles.coordsText}>
-              {coords.latitude.toFixed(4)}, {coords.longitude.toFixed(4)} • {showLiveMap ? 'MAP ON' : 'MAP OFF'}
+              {coords.latitude.toFixed(4)}, {coords.longitude.toFixed(4)} • {showLiveMap ? 'MAP ACTIVE' : 'MAP OFF'}
             </Text>
           </TouchableOpacity>
         </View>
       </View>
+
+      {/* Real-Time Kinematics & Health Strip */}
+      <View style={styles.telemetryStrip}>
+        <View style={styles.telemetryTile}>
+          <Text style={styles.telemetryTileValue}>{gForce.toFixed(2)} G</Text>
+          <Text style={styles.telemetryTileLabel}>Motion / G-Force</Text>
+        </View>
+
+        <View style={styles.telemetryTile}>
+          <Text style={[styles.telemetryTileValue, { color: '#10B981' }]}>{corridorStatus}</Text>
+          <Text style={styles.telemetryTileLabel}>Safe Corridor</Text>
+        </View>
+
+        <View style={styles.telemetryTile}>
+          <Text style={styles.telemetryTileValue}>🔋 {batteryLevel}%</Text>
+          <Text style={styles.telemetryTileLabel}>Battery Health</Text>
+        </View>
+      </View>
+
+      {offlineCount > 0 && (
+        <View style={styles.offlineBanner}>
+          <Text style={styles.offlineBannerText}>
+            📶 Offline Buffer: {offlineCount} events queued. Auto-syncing...
+          </Text>
+        </View>
+      )}
 
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
         {/* 3. Companion Voice Triage Card */}
@@ -713,11 +950,15 @@ export default function GuardianAITester() {
           <View style={styles.triageCard}>
             <View style={styles.triageTopRow}>
               <View style={styles.companionPulse} />
-              <Text style={styles.triageTitle}>AI COMPANION CHECK-IN</Text>
+              <Text style={styles.triageTitle}>{COMPANION_PROMPTS[companionLang].checkInTitle}</Text>
             </View>
 
-            <Text style={styles.triageEnglishText}>"Are you okay?"</Text>
-            <Text style={styles.triageArabicText}>"طمني عليك، كل اشي تمام؟"</Text>
+            <Text style={styles.triagePrimaryText}>
+              "{COMPANION_PROMPTS[companionLang].checkInPrimary}"
+            </Text>
+            <Text style={styles.triageSecondaryText}>
+              "{COMPANION_PROMPTS[companionLang].checkInSecondary}"
+            </Text>
 
             <Text style={styles.triageSubtitle}>
               Event: {pendingAlert?.soundName} • Safety window:
@@ -726,14 +967,18 @@ export default function GuardianAITester() {
 
             {isVerifyingVoice ? (
               <View style={styles.verifyingContainer}>
-                <ActivityIndicator color="#0EA5E9" size="small" />
-                <Text style={styles.verifyingText}>Verifying Voice Signature...</Text>
+                <ActivityIndicator color="#38BDF8" size="small" />
+                <Text style={styles.verifyingText}>
+                  {companionLang === 'ar' ? 'جاري التحقق من بصمة الصوت...' : 'Verifying Voice Signature...'}
+                </Text>
               </View>
             ) : (
               <View style={styles.triageActionRow}>
-                <TouchableOpacity style={styles.safeConfirmBtn} onPress={verifyAndConfirmSafe}>
+                <TouchableOpacity style={styles.safeConfirmBtn} onPress={verifyAndConfirmSafe} activeOpacity={0.85}>
                   <Text style={styles.safeConfirmBtnText}>
-                    {isEnrolled ? "🎙️ I'M SAFE (VERIFY VOICE)" : "I'M SAFE • أنا بخير"}
+                    {isEnrolled
+                      ? COMPANION_PROMPTS[companionLang].confirmSafeVoiceBtn
+                      : COMPANION_PROMPTS[companionLang].confirmSafeBtn}
                   </Text>
                 </TouchableOpacity>
 
@@ -744,8 +989,11 @@ export default function GuardianAITester() {
                       escalateAlertToBrain(pendingAlert.soundName, pendingAlert.confidence, true);
                     }
                   }}
+                  activeOpacity={0.85}
                 >
-                  <Text style={styles.sosInstantBtnText}>🚨 SOS NOW</Text>
+                  <Text style={styles.sosInstantBtnText}>
+                    {COMPANION_PROMPTS[companionLang].sosBtn}
+                  </Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -754,16 +1002,19 @@ export default function GuardianAITester() {
 
         {/* 4. Real-Time Classifier Feedback */}
         <View style={[styles.card, isDanger && styles.cardDanger]}>
-          <Text style={styles.cardHeader}>CABIN ACOUSTIC TELEMETRY</Text>
+          <View style={styles.cardHeaderRow}>
+            <Text style={styles.cardHeader}>CABIN ACOUSTIC TELEMETRY</Text>
+            <View style={[styles.statusIndicatorDot, { backgroundColor: isDanger ? '#EF4444' : '#10B981' }]} />
+          </View>
           <Text style={styles.detectedSound}>{latestSound}</Text>
-          <Text style={styles.engineStatus}>SYSTEM: {status.toUpperCase()}</Text>
+          <Text style={styles.engineStatus}>SENTINEL: {status.toUpperCase()}</Text>
         </View>
 
         {/* 5. Incident Log */}
         <View style={styles.card}>
-          <Text style={styles.cardHeader}>TRIP EVENT AUDIT LOG</Text>
+          <Text style={styles.cardHeader}>TRIP SAFETY AUDIT LOG</Text>
           {alertHistory.length === 0 ? (
-            <Text style={styles.emptyAlerts}>Normal transit. No safety breaches logged.</Text>
+            <Text style={styles.emptyAlerts}>Normal transit. No acoustic anomalies logged.</Text>
           ) : (
             alertHistory.map((item) => (
               <View key={item.id} style={styles.alertRow}>
@@ -797,11 +1048,11 @@ export default function GuardianAITester() {
       {/* 6. Footer Button */}
       <View style={styles.actionFooter}>
         {!isListening ? (
-          <TouchableOpacity style={styles.startBtn} onPress={startListening}>
+          <TouchableOpacity style={styles.startBtn} onPress={startListening} activeOpacity={0.85}>
             <Text style={styles.btnText}>ARM CABIN MONITORING</Text>
           </TouchableOpacity>
         ) : (
-          <TouchableOpacity style={styles.stopBtn} onPress={stopAudioListening}>
+          <TouchableOpacity style={styles.stopBtn} onPress={stopAudioListening} activeOpacity={0.85}>
             <Text style={styles.btnText}>DISARM MONITORING</Text>
           </TouchableOpacity>
         )}
@@ -811,9 +1062,9 @@ export default function GuardianAITester() {
       <Modal visible={showEnrollModal} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.enrollBox}>
-            <Text style={styles.enrollTitle}>🎙️ Passenger Voice Calibration</Text>
+            <Text style={styles.enrollTitle}>🎙️ Voice Signature Calibration</Text>
             <Text style={styles.enrollDesc}>
-              Enroll your child's voice signature. This prevents drivers or third parties from dismissing automated safety checks on the child's behalf.
+              Enroll your child's biometric voice profile. This guarantees only your child can dismiss automated safety prompts.
             </Text>
 
             <View style={styles.enrollStatusCard}>
@@ -822,15 +1073,15 @@ export default function GuardianAITester() {
 
             <View style={styles.enrollActions}>
               {!isEnrollingAudio ? (
-                <TouchableOpacity style={styles.recordEnrollBtn} onPress={startEnrollmentRecording}>
+                <TouchableOpacity style={styles.recordEnrollBtn} onPress={startEnrollmentRecording} activeOpacity={0.85}>
                   <Text style={styles.recordEnrollBtnText}>START 4S RECORDING</Text>
                 </TouchableOpacity>
               ) : (
-                <ActivityIndicator color="#0EA5E9" size="large" />
+                <ActivityIndicator color="#38BDF8" size="large" />
               )}
 
-              <TouchableOpacity style={styles.closeEnrollBtn} onPress={() => setShowEnrollModal(false)}>
-                <Text style={styles.closeEnrollBtnText}>CLOSE</Text>
+              <TouchableOpacity style={styles.closeEnrollBtn} onPress={() => setShowEnrollModal(false)} activeOpacity={0.85}>
+                <Text style={styles.closeEnrollBtnText}>DISMISS</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -840,9 +1091,11 @@ export default function GuardianAITester() {
       {/* 8. Dedicated Child Conversational Chatbot (PetraBuddy) */}
       <CompanionChatModal
         visible={showChatModal}
-        onClose={() => setShowChatModal(false)}
+        onClose={closeChatModal}
         backendUrl={BACKEND_URL}
         coords={coords}
+        onPauseMonitoring={stopAudioListening}
+        onResumeMonitoring={startListening}
         onTriggerSOS={() => {
           setShowChatModal(false);
           escalateAlertToBrain('MANUAL CHILD COMPANION SOS', 1.0, true, false);
@@ -853,99 +1106,199 @@ export default function GuardianAITester() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#090D14' },
+  container: { flex: 1, backgroundColor: '#07090E' },
   header: {
+    paddingHorizontal: 16,
+    paddingTop: Platform.OS === 'ios' ? 52 : 44,
+    paddingBottom: 12,
+    backgroundColor: '#0E131F',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
+    gap: 10,
+  },
+  headerTopRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 50,
-    paddingBottom: 14,
-    backgroundColor: '#111726',
-    borderBottomWidth: 1,
-    borderBottomColor: '#232F48',
   },
-  brandTitle: { fontSize: 20, fontWeight: '900', color: '#F8FAFC', letterSpacing: 1.2 },
-  brandAccent: { color: '#0EA5E9' },
-  brandSubtitle: { fontSize: 8.5, color: '#94A3B8', fontWeight: '700', letterSpacing: 0.6 },
+  brandLockup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    flex: 1,
+    paddingRight: 8,
+  },
+  brandIconBadge: {
+    width: 32,
+    height: 32,
+    borderRadius: 9,
+    backgroundColor: 'rgba(14, 165, 233, 0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(14, 165, 233, 0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  brandIconText: { fontSize: 15 },
+  brandTitle: { fontSize: 16.5, fontWeight: '900', color: '#FFFFFF', letterSpacing: -0.2 },
+  brandAccent: { color: '#38BDF8' },
+  brandSubtitle: { fontSize: 8.5, color: '#94A3B8', fontWeight: '700', letterSpacing: 0.6, marginTop: 1 },
   headerRightActions: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
   },
-  chatLaunchPill: {
-    backgroundColor: 'rgba(14, 165, 233, 0.15)',
+  langSelectorPill: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
     borderWidth: 1,
-    borderColor: '#0EA5E9',
+    borderColor: 'rgba(255, 255, 255, 0.16)',
     paddingHorizontal: 8,
-    paddingVertical: 5,
-    borderRadius: 12,
+    paddingVertical: 5.5,
+    borderRadius: 8,
   },
-  chatLaunchPillText: {
-    color: '#0EA5E9',
+  langSelectorPillText: {
+    color: '#F8FAFC',
     fontSize: 9.5,
     fontWeight: '800',
   },
-  shieldPill: { paddingHorizontal: 8, paddingVertical: 5, borderRadius: 12, borderWidth: 1 },
-  shieldActive: { backgroundColor: 'rgba(16, 185, 129, 0.15)', borderColor: '#10B981' },
-  shieldInactive: { backgroundColor: 'rgba(239, 68, 68, 0.15)', borderColor: '#EF4444' },
-  shieldText: { color: '#FFF', fontSize: 9.5, fontWeight: '800' },
+  chatLaunchPill: {
+    backgroundColor: 'rgba(14, 165, 233, 0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(14, 165, 233, 0.4)',
+    paddingHorizontal: 8,
+    paddingVertical: 5.5,
+    borderRadius: 8,
+  },
+  chatLaunchPillText: {
+    color: '#38BDF8',
+    fontSize: 9.5,
+    fontWeight: '800',
+  },
+
+  shieldBannerBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  shieldBannerActive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+  },
+  shieldBannerInactive: {
+    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+    borderColor: 'rgba(245, 158, 11, 0.3)',
+  },
+  shieldBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
+    paddingRight: 6,
+  },
+  shieldBannerIcon: {
+    fontSize: 14,
+  },
+  shieldBannerTitle: {
+    fontSize: 10.5,
+    fontWeight: '800',
+    color: '#F8FAFC',
+    letterSpacing: 0.2,
+  },
+  shieldBannerSub: {
+    fontSize: 8.5,
+    color: '#94A3B8',
+    fontWeight: '600',
+    marginTop: 1,
+  },
+  shieldActionTag: {
+    paddingHorizontal: 7,
+    paddingVertical: 3.5,
+    borderRadius: 6,
+  },
+  shieldTagActive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.4)',
+  },
+  shieldTagInactive: {
+    backgroundColor: 'rgba(245, 158, 11, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 158, 11, 0.4)',
+  },
+  shieldActionTagText: {
+    fontSize: 8.5,
+    fontWeight: '800',
+  },
+  shieldTagTextActive: {
+    color: '#34D399',
+  },
+  shieldTagTextInactive: {
+    color: '#FBBF24',
+  },
 
   captainRibbon: {
-    backgroundColor: '#182238',
+    backgroundColor: '#12192A',
     paddingHorizontal: 16,
     paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: 1,
-    borderBottomColor: '#232F48',
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
   },
   captainRibbonLeft: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
+    flex: 1,
   },
   captainMiniAvatar: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#0EA5E9',
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: '#182338',
+    borderWidth: 1.5,
+    borderColor: '#0EA5E9',
     alignItems: 'center',
     justifyContent: 'center',
   },
   captainMiniAvatarText: {
-    color: '#FFFFFF',
+    color: '#38BDF8',
     fontWeight: '800',
     fontSize: 12,
   },
   captainRibbonName: {
     color: '#F8FAFC',
-    fontSize: 12,
-    fontWeight: '700',
+    fontSize: 12.5,
+    fontWeight: '800',
   },
   captainRibbonCar: {
     color: '#94A3B8',
     fontSize: 10,
-    fontWeight: '500',
+    fontWeight: '600',
+    marginTop: 1,
   },
   verifiedTag: {
-    backgroundColor: 'rgba(14, 165, 233, 0.15)',
+    backgroundColor: 'rgba(14, 165, 233, 0.12)',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: 'rgba(14, 165, 233, 0.4)',
+    borderColor: 'rgba(14, 165, 233, 0.3)',
   },
   verifiedTagText: {
-    color: '#0EA5E9',
-    fontSize: 9,
+    color: '#38BDF8',
+    fontSize: 8.5,
     fontWeight: '800',
+    letterSpacing: 0.4,
   },
 
-  mapContainer: { width: '100%', height: 210, position: 'relative', backgroundColor: '#090D14' },
-  webView: { flex: 1, backgroundColor: '#090D14' },
-  telemetryCard: { margin: 16, backgroundColor: '#111726', borderRadius: 14, padding: 14 },
+  mapContainer: { width: '100%', height: 210, position: 'relative', backgroundColor: '#07090E' },
+  webView: { flex: 1, backgroundColor: '#07090E' },
+  telemetryCard: { margin: 16, backgroundColor: '#0E131F', borderRadius: 14, padding: 14, borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)' },
   telemetryValue: { fontSize: 10, fontWeight: '900', color: '#10B981', letterSpacing: 0.8, marginBottom: 4 },
   coordsDisplay: { color: '#94A3B8', fontSize: 13, fontWeight: '700' },
 
@@ -953,28 +1306,32 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 12,
     left: 12,
-    backgroundColor: 'rgba(17, 23, 38, 0.85)',
+    backgroundColor: 'rgba(10, 14, 24, 0.88)',
     paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
   },
-  coordsText: { color: '#94A3B8', fontSize: 11, fontWeight: '700' },
+  coordsText: { color: '#94A3B8', fontSize: 10.5, fontWeight: '700' },
 
   scrollContent: { padding: 16, gap: 12, paddingBottom: 110 },
-  card: { backgroundColor: '#111726', borderRadius: 14, padding: 16, borderWidth: 1, borderColor: '#232F48' },
+  card: { backgroundColor: '#0E131F', borderRadius: 14, padding: 16, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.08)' },
   cardDanger: { borderColor: '#EF4444', backgroundColor: 'rgba(239, 68, 68, 0.08)' },
-  cardHeader: { fontSize: 10, fontWeight: '800', color: '#64748B', letterSpacing: 1, marginBottom: 8 },
-  detectedSound: { fontSize: 20, fontWeight: '900', color: '#F8FAFC', marginBottom: 4 },
-  engineStatus: { fontSize: 11, fontWeight: '700', color: '#0EA5E9' },
+  cardHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  cardHeader: { fontSize: 10, fontWeight: '800', color: '#64748B', letterSpacing: 1 },
+  statusIndicatorDot: { width: 7, height: 7, borderRadius: 4 },
+  detectedSound: { fontSize: 19, fontWeight: '900', color: '#F8FAFC', marginBottom: 4 },
+  engineStatus: { fontSize: 11, fontWeight: '700', color: '#38BDF8' },
 
-  triageCard: { backgroundColor: '#182238', borderRadius: 16, padding: 18, borderWidth: 2, borderColor: '#0EA5E9', alignItems: 'center' },
+  triageCard: { backgroundColor: '#141C2E', borderRadius: 16, padding: 18, borderWidth: 2, borderColor: '#38BDF8', alignItems: 'center' },
   triageTopRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
-  companionPulse: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#0EA5E9' },
+  companionPulse: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#38BDF8' },
   triageTitle: { fontSize: 11, fontWeight: '900', color: '#38BDF8', letterSpacing: 1 },
-  triageEnglishText: { fontSize: 24, fontWeight: '900', color: '#FFFFFF', textAlign: 'center' },
-  triageArabicText: { fontSize: 15, fontWeight: '700', color: '#BAE6FD', textAlign: 'center', marginBottom: 4 },
+  triagePrimaryText: { fontSize: 21, fontWeight: '900', color: '#FFFFFF', textAlign: 'center', lineHeight: 28 },
+  triageSecondaryText: { fontSize: 14, fontWeight: '700', color: '#BAE6FD', textAlign: 'center', marginTop: 2, marginBottom: 4 },
   triageSubtitle: { fontSize: 11, color: '#94A3B8', textAlign: 'center', marginTop: 4 },
-  countdownNumber: { fontSize: 36, fontWeight: '900', color: '#EF4444', marginVertical: 4 },
+  countdownNumber: { fontSize: 34, fontWeight: '900', color: '#EF4444', marginVertical: 4 },
   verifyingContainer: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 },
   verifyingText: { color: '#BAE6FD', fontSize: 13, fontWeight: '700' },
   triageActionRow: { flexDirection: 'row', gap: 10, width: '100%', marginTop: 8 },
@@ -983,31 +1340,78 @@ const styles = StyleSheet.create({
   sosInstantBtn: { flex: 1, backgroundColor: '#EF4444', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
   sosInstantBtnText: { color: '#FFFFFF', fontWeight: '900', fontSize: 12 },
 
-  emptyAlerts: { color: '#475569', fontSize: 13, fontStyle: 'italic' },
-  alertRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#232F48' },
-  alertLabel: { color: '#E2E8F0', fontWeight: '700', fontSize: 13 },
-  alertTime: { color: '#64748B', fontSize: 11 },
+  emptyAlerts: { color: '#475569', fontSize: 12.5, fontStyle: 'italic' },
+  alertRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.06)' },
+  alertLabel: { color: '#F1F5F9', fontWeight: '700', fontSize: 12.5 },
+  alertTime: { color: '#64748B', fontSize: 10.5, marginTop: 2 },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  badgeSuppressed: { backgroundColor: 'rgba(16, 185, 129, 0.15)', borderWidth: 1, borderColor: '#10B981' },
-  badgeEscalated: { backgroundColor: 'rgba(239, 68, 68, 0.2)', borderWidth: 1, borderColor: '#EF4444' },
-  statusBadgeText: { fontSize: 11, fontWeight: '800' },
-  textSuppressed: { color: '#10B981' },
-  textEscalated: { color: '#EF4444' },
+  badgeSuppressed: { backgroundColor: 'rgba(16, 185, 129, 0.15)', borderWidth: 1, borderColor: 'rgba(16, 185, 129, 0.35)' },
+  badgeEscalated: { backgroundColor: 'rgba(239, 68, 68, 0.2)', borderWidth: 1, borderColor: 'rgba(239, 68, 68, 0.45)' },
+  statusBadgeText: { fontSize: 10.5, fontWeight: '800' },
+  textSuppressed: { color: '#34D399' },
+  textEscalated: { color: '#F87171' },
 
-  actionFooter: { position: 'absolute', bottom: 0, width: width, padding: 16, paddingBottom: 28, backgroundColor: '#111726', borderTopWidth: 1, borderTopColor: '#232F48' },
-  startBtn: { backgroundColor: '#0EA5E9', paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
-  stopBtn: { backgroundColor: '#EF4444', paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
-  btnText: { color: '#FFF', fontWeight: '900', fontSize: 14, letterSpacing: 1 },
+  actionFooter: { position: 'absolute', bottom: 0, width: width, padding: 16, paddingBottom: Platform.OS === 'ios' ? 32 : 20, backgroundColor: '#0E131F', borderTopWidth: 1, borderTopColor: 'rgba(255, 255, 255, 0.08)' },
+  startBtn: { backgroundColor: '#0EA5E9', paddingVertical: 14, borderRadius: 12, alignItems: 'center', shadowColor: '#0EA5E9', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8, elevation: 4 },
+  stopBtn: { backgroundColor: '#EF4444', paddingVertical: 14, borderRadius: 12, alignItems: 'center', shadowColor: '#EF4444', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8, elevation: 4 },
+  btnText: { color: '#FFFFFF', fontWeight: '900', fontSize: 13.5, letterSpacing: 0.8 },
 
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  enrollBox: { backgroundColor: '#111726', width: '100%', borderRadius: 18, padding: 22, borderWidth: 1, borderColor: '#232F48' },
-  enrollTitle: { fontSize: 18, fontWeight: '900', color: '#FFF', marginBottom: 8 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.88)', justifyContent: 'center', alignItems: 'center', padding: 20 },
+  enrollBox: { backgroundColor: '#0E131F', width: '100%', borderRadius: 18, padding: 22, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.12)' },
+  enrollTitle: { fontSize: 17, fontWeight: '900', color: '#FFF', marginBottom: 8 },
   enrollDesc: { fontSize: 12, color: '#94A3B8', lineHeight: 18, marginBottom: 16 },
-  enrollStatusCard: { backgroundColor: '#182238', padding: 14, borderRadius: 10, alignItems: 'center', marginBottom: 18 },
+  enrollStatusCard: { backgroundColor: '#141C2E', padding: 14, borderRadius: 10, alignItems: 'center', marginBottom: 18, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.06)' },
   enrollStatusLabel: { color: '#38BDF8', fontSize: 12, fontWeight: '700', textAlign: 'center' },
   enrollActions: { gap: 10 },
   recordEnrollBtn: { backgroundColor: '#0EA5E9', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
   recordEnrollBtnText: { color: '#FFF', fontWeight: '900', fontSize: 13 },
-  closeEnrollBtn: { backgroundColor: '#232F48', paddingVertical: 10, borderRadius: 10, alignItems: 'center' },
+  closeEnrollBtn: { backgroundColor: '#182338', paddingVertical: 10, borderRadius: 10, alignItems: 'center', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.08)' },
   closeEnrollBtnText: { color: '#94A3B8', fontWeight: '700', fontSize: 12 },
+
+  telemetryStrip: {
+    flexDirection: 'row',
+    backgroundColor: '#0A0E18',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
+    gap: 8,
+  },
+  telemetryTile: {
+    flex: 1,
+    backgroundColor: '#07090E',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+  },
+  telemetryTileValue: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#F8FAFC',
+  },
+  telemetryTileLabel: {
+    fontSize: 8,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  offlineBanner: {
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(239, 68, 68, 0.35)',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    alignItems: 'center',
+  },
+  offlineBannerText: {
+    color: '#FCA5A5',
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
 });

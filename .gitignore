@@ -63,11 +63,13 @@ web-build/
 Thumbs.db
 
 # ==============================
-# Logs & Environment Variables
+# Logs & Environment Variables & Local Data
 # ==============================
 *.log
+*.db
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .env
 .env.*
+backend/voice_profiles/*.pt
