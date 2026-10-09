@@ -365,15 +365,29 @@ export const CompanionChatModal: React.FC<CompanionChatModalProps> = ({
           <View style={styles.countdownBanner}>
             <View style={{ flex: 1 }}>
               <Text style={styles.countdownText}>
-                ⚠️ Alerting Operations & Parents in {sosCountdown}s...
+                Alerting 911 & Operations in {sosCountdown}s...
               </Text>
               <Text style={styles.countdownSub}>Tap cancel if this was a mistake.</Text>
             </View>
-            <TouchableOpacity style={styles.cancelSosBtn} onPress={cancelSosCountdown} activeOpacity={0.85}>
-              <Text style={styles.cancelSosBtnText}>CANCEL ✕</Text>
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', gap: 6 }}>
+              <TouchableOpacity style={styles.cancelSosBtn} onPress={cancelSosCountdown} activeOpacity={0.85}>
+                <Text style={styles.cancelSosBtnText}>CANCEL</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.cancelSosBtn, { backgroundColor: '#EF4444', borderColor: '#DC2626' }]}
+                onPress={() => {
+                  if (sosTimerRef.current) clearInterval(sosTimerRef.current);
+                  setSosCountdown(null);
+                  onTriggerSOS();
+                }}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.cancelSosBtnText}>SEND NOW</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
+
 
         {/* Messages Feed */}
         <FlatList

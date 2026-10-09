@@ -10,4 +10,6 @@ class Alert(Base):
     confidence = Column(Float)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="INCIDENT_FLAGGED")
+    details = Column(String, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)

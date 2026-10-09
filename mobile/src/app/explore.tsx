@@ -12,6 +12,7 @@ import {
 
 export default function ExploreDiagnostics() {
   const [backendUrl, setBackendUrl] = useState('http://192.168.1.29:8000');
+
   const [useGeofenceAlerts, setUseGeofenceAlerts] = useState(true);
   const [autoSmsFallback, setAutoSmsFallback] = useState(false);
   const [pingStatus, setPingStatus] = useState<string | null>(null);

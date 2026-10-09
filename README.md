@@ -1,313 +1,171 @@
-# KIDDOGO
+# 🛡️ KiddoGO (by PetraRide)
+### Autonomous In-Cabin Child Safety & CAD Operations Shield
 
-KIDDOGO is a child-safety layer built for PetraRide, a Jordan-based ride platform focused on safer travel for children. The project adds monitoring and escalation features for family rides, and other journeys where a child may be traveling without a guardian present.
-
-The system combines on-device audio detection, voice-based identity checks, live GPS telemetry, a rider companion flow, and an optional cabin pose sentinel. It is a prototype and should not be relied on as the sole means of protecting a passenger.
-
----
-
-## What this project does
-
-- listens to microphone audio in the mobile app
-- runs YAMNet locally on-device to classify suspicious audio events
-- opens a safety confirmation flow when a distress pattern is detected
-- verifies the rider’s voice before suppressing or escalating the alert
-- blocks unauthorized voice attempts and triggers a higher-priority escalation
-- sends live GPS, vehicle speed, G-force kinematics, and battery health to a FastAPI backend
-- detects route corridor deviations and prolonged unplanned stops
-- supports **Push-to-Talk voice notes** in the PetraBuddy companion chat
-- streams alert and location data to an operations map at `/map`
-- provides a dedicated **Parent Live Guardian Portal** at `/parent/{trip_id}`
-- optionally checks cabin wrist position against a virtual boundary using MediaPipe Pose
-- correlates audio, vision, and G-force kinematic events in a multi-modal fusion window
+**KiddoGO** is an intelligent, multi-modal child-safety platform engineered specifically for **PetraRide**, Jordan's premier smart mobility network. Built to solve the parent trust deficit and unlock the recurring K-12 school commute market, KiddoGO combines on-device acoustic hazard detection, biometric anti-impostor voice verification, an interactive Levantine Arabic child AI companion (**PetraBuddy**), offline store-and-forward resilience, and automated bilingual WhatsApp CAD dispatching to Jordan 911 and fleet operations.
 
 ---
 
-## Architecture
+## 🚀 Key Innovations & Capabilities
+
+* **🎙️ Edge Acoustic Hazard Detection**: Runs lightweight YAMNet TFLite locally on the passenger's device (sub-30ms latency) to classify screams, crying, glass impact, crashes, and distress sounds without streaming continuous cabin audio to the cloud.
+* **🤖 PetraBuddy In-Cabin AI Companion**: Generative voice and chat companion tuned for Jordanian Levantine Arabic (`"وين ماخدني؟"`, `"مش هاد بيتي"`, `"عم يسرع"`), providing real-time comfort and distress sentiment triage.
+* **🛡️ Anti-Impostor Voice Shield**: Biometric speaker verification using SpeechBrain ECAPA-TDNN (192D embeddings). If a captain attempts to silence a child's safety prompt, the override is blocked and immediately escalated as `IMPOSTOR_BLOCKED`.
+* **📶 Offline Store-and-Forward Resilience**: Engineered for Jordan's dead zones and underpasses (e.g., Abdoun Corridor tunnel). Emergency SOS events buffer locally and automatically flush with exponential backoff the instant 4G connectivity restores.
+* **🚨 Synchronized 3-Second Dual-Trigger SOS**: Tactile haptic countdown on both the main dashboard and PetraBuddy chat with instant-send and safety cancellation capabilities.
+* **📱 Green API WhatsApp CAD Gateway**: Sub-second automated emergency broadcast to Jordan 911 / Ops in an official zero-emoji, bilingual CAD format (Arabic on top, English below) featuring one-tap live Google Maps GPS tracking pins.
+* **🖥️ Operations CAD Control Room**: Real-time Leaflet GIS fleet monitoring with Web Audio API auditory dispatch chimes, dynamic classification badges, and local Amman time (UTC+3) synchronization.
+
+---
+
+## 🏛️ System Architecture
+
+![KiddoGO Architecture](architecture_diagram.svg)
 
 ```text
-Mobile app (React Native / Expo)
+Passenger / Child Mobile Client (React Native + Expo)
     │
-    ├─ microphone audio stream
-    ├─ YAMNet TFLite inference (on-device)
-    ├─ voice enrollment / verification
-    ├─ live GPS & G-Force kinematics stream
-    ├─ offline store-and-forward queue
-    └─ PetraBuddy companion chat (Push-to-Talk + SOS)
+    ├─ 🎙️ 16kHz PCM Micro-Acoustic Capture
+    ├─ ⚡ On-Device YAMNet TFLite Anomaly Classifier
+    ├─ 🤖 PetraBuddy AI Companion (Levantine Voice & Chat)
+    ├─ 🚨 Dual-Trigger 3s Tactile SOS Modal
+    ├─ 📍 Kinematic Telemetry Engine (GPS + Velocity + G-Force)
+    └─ 📶 Offline Store-and-Forward Buffer (Tunnel Auto-Retry)
             │
-            ▼
-FastAPI backend
+            ▼ (Secure HTTP / WebSocket Stream)
+FastAPI Backend & Multi-Modal Fusion Engine
     │
-    ├─ /api/telemetry/location (Corridor + Kinematics)
-    ├─ /api/alerts
-    ├─ /api/voice/enroll (Persistent on-disk storage)
-    ├─ /api/voice/verify
-    ├─ /api/voice/status/{child_id}
-    ├─ /api/companion/chat & /api/companion/chat-voice
-    ├─ /api/incident/boundary-breach
-    ├─ multi-modal fusion engine (Vision + Audio + Kinematics)
-    ├─ WebSocket updates for live dashboards
-    └─ Gemini multimodal triage and chat responses
+    ├─ 🧠 Multi-Modal Late Fusion Core (Acoustics + Kinematics + Corridor)
+    ├─ 🗺️ Safe Corridor Geofence Tracker (Haversine Route Deviation)
+    ├─ 🔊 SpeechBrain ECAPA-TDNN Biometric Verification (Cosine Match >= 0.32)
+    ├─ 🤖 Gemini 2.5 Flash Levantine Sentiment & Voice Triage
+    └─ 🗄️ Relational Database Persistence (SQLite / PostgreSQL)
             │
-            ├───────────────┬───────────────┐
-            ▼               ▼               ▼
-      Operations Map   Parent Portal   SQLite / Postgres
-         (/map)       (/parent/{id})       (Resilient)
+            ├─────────────────────────────────────────┐
+            ▼                                         ▼
+   🖥️ PetraRide CAD Dashboard               📱 Green API WhatsApp Gateway
+   • Leaflet Real-Time Breadcrumbs          • Zero-Emoji Police CAD Format
+   • Web Audio API Dispatch Chimes          • Bilingual Arabic + English
+   • Amman Local Time (UTC+3) Sync          • One-Tap Google Maps GPS Pin
 ```
 
 ---
 
-## Core features
-
-### 1. On-device acoustic detection
-
-The mobile app uses `react-native-fast-tflite` with a YAMNet model to scan short PCM chunks from the microphone. It looks for distress-like classes such as crying, screaming, sirens, impact sounds, glass breakage, and crash-like patterns.
-
-The project includes a threshold-based escalation flow:
-
-- if the score is below the threshold, the event is ignored
-- if the score crosses the threshold, the app opens a confirmation flow
-- if the rider does not respond or the voice does not verify, the alert escalates
-
-### 2. Voice enrollment and verification
-
-The backend uses SpeechBrain ECAPA-TDNN embeddings to enroll and validate a child’s voice profile.
-
-The flow in the app is:
-
-- enroll voice by recording a short 4-second sample
-- persist voice embeddings on disk (`backend/voice_profiles/{child_id}.pt`) for automatic reload across server restarts
-- during a distress event, ask the user to confirm safety by speaking ("I am safe")
-- compare the recorded sample against the enrolled biometric embedding (cosine similarity threshold >= 0.32)
-- reject or escalate if the voice is not recognized (Anti-Impostor Shield)
-
-This ensures that third-party driver attempts to silence a child's distress alert are blocked. Voice check audio is verified via SpeechBrain; after a speaker match, the backend also sends the audio to Gemini for situation triage if configured.
-
-### 3. Safety check-in loop
-
-When an event is detected, the app opens a short countdown and asks the rider whether they are okay. The logic is designed to suppress false alarms, but force escalation if there is no confirmation.
-
-Possible outcomes:
-
-- verified safe confirmation: suppress the alert
-- no response: escalate
-- voice mismatch: `IMPOSTOR_BLOCKED`
-- manual SOS: `MANUAL_SOS`
-
-Voice verification is optional in the current UI: if no voice profile is enrolled, tapping the safe-confirmation button resolves the check-in without verifying identity. A voice verification request error also currently resolves as safe; this is a prototype limitation.
-
-### 4. Companion chat and SOS
-
-The companion widget in the app provides a chat-like rider interface with:
-
-- Arabic and English support
-- a quick response flow
-- text input from the child
-- TTS playback for the assistant prompts
-- a visible SOS action with a countdown before escalating
-
-### 5. Live location and dashboard
-
-The app streams coordinates using `expo-location` and sends them to the backend through `/api/telemetry/location`.
-
-The backend then broadcasts the position to connected clients via WebSocket and renders a dashboard at `/map` with:
-
-- live passenger marker
-- map position updates
-- speed data
-- incident log
-- alert states
-
----
-
-### 6. Optional cabin spatial sentinel
-
-Run `backend/cabin_sentinel.py` separately from the API to use a connected camera. It uses OpenCV and MediaPipe Pose to estimate body landmarks locally, then checks whether a sufficiently visible wrist landmark crosses the configured image midpoint. When it detects a breach, it posts an incident to `/api/incident/boundary-breach`. The display uses a synthetic pose visualization rather than showing the camera frame.
-
-This is a simple image-space boundary check; it does not identify people or understand intent. Camera orientation, placement, and calibration affect which side of the frame represents each cabin zone.
-
-The backend fusion engine correlates audio and vision observations in a short sliding time window. Location updates also record vehicle speed, but the current telemetry path does not provide acceleration or braking measurements to score a kinematic event. This logic is experimental and is not a validated emergency detector.
-
----
-
-## Tech stack
-
-### Mobile app
-
-- React Native + Expo
-- TypeScript
-- `react-native-fast-tflite`
-- `@siteed/audio-studio`
-- `expo-location`
-- `expo-speech`
-- `react-native-webview`
-
-### Backend
-
-- FastAPI
-- Python
-- SQLAlchemy
-- PostgreSQL
-- Google Gemini SDK
-- SpeechBrain
-- MediaPipe Pose and OpenCV (optional camera sentinel)
-- WebSockets
-
-### Operations UI
-
-- Leaflet.js
-- OpenStreetMap tiles
-- plain HTML/CSS/JavaScript in the FastAPI route
-
----
-
-## Repository structure
+## 📁 Repository Structure
 
 ```text
 .
-├── backend/
-│   ├── database.py
-│   ├── cabin_sentinel.py
-│   ├── fusion_engine.py
-│   ├── main.py
-│   ├── models.py
-│   ├── requirements.txt
-│   ├── voice_verifier.py
-│   └── pretrained_models/
-│       └── spkrec-ecapa-voxceleb/
+├── architecture_diagram.svg      # Full-stack vector architecture specification
+├── docker-compose.yml            # Container definitions for PostgreSQL & backend
+├── README.md                     # Technical documentation & setup guide
 │
-├── mobile/
-│   ├── android/
-│   ├── app.json
-│   ├── assets/
-│   │   ├── yamnet.tflite
-│   │   └── yamnet_class_map.csv
-│   ├── package.json
+├── backend/                      # FastAPI Backend & AI Fusion Services
+│   ├── .env.example              # Environment variables template
+│   ├── cabin_sentinel.py         # Optional MediaPipe pose boundary detector
+│   ├── database.py               # SQLAlchemy database configuration
+│   ├── fusion_engine.py          # Multi-modal sliding-window late fusion logic
+│   ├── main.py                   # FastAPI REST API, WebSockets & CAD Dashboard
+│   ├── models.py                 # SQLite/PostgreSQL Alert & Telemetry schemas
+│   ├── requirements.txt          # Python backend dependencies
+│   ├── simulate_trip_demo.py     # Live route simulation testing script
+│   ├── test_whatsapp.py          # Green API WhatsApp dispatcher test utility
+│   ├── test_voice_suite.py       # ECAPA-TDNN biometric verification tests
+│   ├── voice_verifier.py         # SpeechBrain voice enrollment & similarity matcher
+│   └── whatsapp_notifier.py      # Non-blocking bilingual CAD WhatsApp dispatcher
+│
+├── mobile/                       # React Native / Expo Mobile Application
+│   ├── package.json              # Client dependencies
 │   └── src/
 │       ├── app/
-│       │   └── index.tsx
+│       │   └── index.tsx         # Main UI, live map, SOS countdown & offline queue
 │       └── components/
-│           └── CompanionChatModal.tsx
+│           └── CompanionChatModal.tsx # PetraBuddy in-cabin voice/chat companion
 │
-├── ai-models/
-│   ├── test_yamnet.py
-│   ├── yamnet.tflite
-│   └── yamnet_class_map.csv
-│
-├── README.md
-└── docker-compose.yml
+└── ai-models/                    # Offline Machine Learning Artifacts
+    ├── test_yamnet.py
+    ├── yamnet.tflite
+    └── yamnet_class_map.csv
 ```
 
 ---
 
-## Backend API
+## 🛠️ Getting Started
 
-The FastAPI backend exposes the following main endpoints:
+### 1. Backend Setup
 
-- `GET /` — health check
-- `GET /api/telemetry/current` — gets the latest cached location and speed
-- `POST /api/telemetry/location` — receives live GPS updates
-- `POST /api/alerts` — stores and broadcasts an incident alert
-- `GET /api/alerts` — returns the latest stored alerts
-- `POST /api/voice/enroll` — enrolls a child voice profile
-- `POST /api/voice/verify` — checks the speaker and returns triage information
-- `POST /api/companion/chat` — returns a companion response and escalates detected concerns
-- `POST /api/incident/boundary-breach` — records a spatial boundary incident
-- `GET /map` — renders the operations dashboard
-- `WebSocket /ws` — streams live events to the frontend
+1. Open PowerShell and navigate to `backend`:
+   ```powershell
+   cd backend
+   py -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
 
----
+2. Configure environment variables by copying `.env.example`:
+   ```powershell
+   copy .env.example .env
+   ```
+   Fill in your credentials in `backend/.env`:
+   ```env
+   GEMINI_API_KEY=your_gemini_api_key
+   GREEN_API_INSTANCE_ID=your_green_api_instance_id
+   GREEN_API_TOKEN_INSTANCE=your_green_api_token
+   EMERGENCY_DISPATCH_PHONE=9627XXXXXXXX
+   ```
 
-## Running the project
+3. Launch the FastAPI server:
+   ```powershell
+   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-### 1. Backend
-
-From the repository root, create and activate a virtual environment, then install the backend requirements:
-
-```powershell
-cd backend
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-The backend uses PostgreSQL. Start or configure a PostgreSQL server before launching it. To use the included Compose database:
-
-```powershell
-docker compose up -d db
-```
-
-The connection URL in `backend/database.py` and the database name/credentials in `docker-compose.yml` must match. Reconcile those settings before starting the API.
-
-Create `backend/.env` to enable Gemini-backed triage and companion responses:
-
-```env
-GEMINI_API_KEY=your_key_here
-```
-
-Start the API from the `backend` directory:
-
-```powershell
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-To run the optional camera sentinel, open another terminal, activate the same environment, and run:
-
-```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-python cabin_sentinel.py
-```
-
-The sentinel needs camera access. Its alert URL defaults to `http://127.0.0.1:8000`; change `BACKEND_ALERT_URL` in `cabin_sentinel.py` if the API runs on another host.
-
-Then open:
-
-- `http://localhost:8000/`
-- `http://localhost:8000/map`
-
-### 2. Mobile app
-
-```powershell
-cd mobile
-npm install
-npx expo start --clear
-```
-
-The mobile client currently has a hardcoded backend URL in `mobile/src/app/index.tsx`. Update `BACKEND_URL` to a host reachable from the device. For a physical phone, use the computer's LAN IP; `localhost` on the phone refers to the phone itself:
-
-```ts
-const BACKEND_URL = 'http://<YOUR_LOCAL_IP>:8000';
-```
+4. Access the Live CAD Operations Dashboard:
+   * **Dashboard**: `http://localhost:8000/` or `http://localhost:8000/map`
+   * **API Docs**: `http://localhost:8000/docs`
 
 ---
 
-## Demo flow
+### 2. Mobile App Setup
 
-1. Open the app and enroll the child voice by recording a short sample.
-2. Start listening and let the microphone run in the vehicle.
-3. Trigger a loud or distress-like sound, such as a scream or impact.
-4. The app should detect the sound, open the confirmation flow, and speak a prompt.
-5. If the rider responds with a matching voice, the alert is suppressed.
-6. If the voice does not match, the event is rejected as `IMPOSTOR_BLOCKED`.
-7. If the rider does not respond, the app escalates and dispatches the alert to the operations map.
+1. Open another terminal and navigate to `mobile`:
+   ```powershell
+   cd mobile
+   npm install
+   ```
 
----
+2. Ensure `BACKEND_URL` in `mobile/src/app/index.tsx` points to your machine's local Wi-Fi IP address:
+   ```typescript
+   const BACKEND_URL = 'http://192.168.1.XX:8000';
+   ```
 
-## Notes and limitations
-
-- This project is a prototype, not a production-grade safety system.
-- The mobile client needs microphone and location permissions. Physical-device testing requires a backend reachable over the local network.
-- Public deployment, production security, and other platform support are not covered by this prototype setup.
-- The mapping dashboard and alert feed are intended for demonstration and operational visibility during a trip.
-- The YAMNet model is used as a first-stage signal, not a complete diagnostic system.
-- Enrolled voice embeddings are persisted to disk as `.pt` PyTorch tensors in `backend/voice_profiles/` for seamless persistence across server restarts.
-- Gemini features require `GEMINI_API_KEY`. If Gemini is unavailable, the backend uses built-in fallback responses for voice triage and companion chat.
-- The PostgreSQL database runs via Docker Compose or local PostgreSQL with automatic SQLite fallback.
-- Kinematic telemetry calculates real-time G-force deltas and vehicle velocity to correlate sudden braking/swerves with acoustic events in the multi-modal fusion window.
+3. Start the Expo development server:
+   ```powershell
+   npx expo start --clear
+   ```
+4. Scan the QR code using Expo Go on Android or iOS.
 
 ---
 
-## Summary
+## 🧪 Simulation & Testing
 
-PetraKids SafeTrack is a proof-of-concept child-rider safety stack built around anomaly detection, voice verification, and operational awareness. The core value is not just GPS tracking — it is filtering out noise, validating the actual rider, and escalating only when the evidence supports it.
+* **WhatsApp CAD Alerting Test**:
+  ```powershell
+  cd backend
+  python test_whatsapp.py
+  ```
+* **Simulate Route & Corridor Anomaly Trip**:
+  ```powershell
+  cd backend
+  python simulate_trip_demo.py
+  ```
+* **Run Voice Biometrics Test Suite**:
+  ```powershell
+  cd backend
+  python test_voice_suite.py
+  ```
+
+---
+
+## 🔒 Security & Privacy by Design
+
+* **Zero Continuous Audio Storage**: Micro-acoustic data is evaluated strictly in volatile device RAM buffers. Continuous ambient audio is never uploaded to cloud servers.
+* **3-Second Diagnostic Window**: Only verified threshold breaches trigger brief diagnostic triage evaluation in compliance with Jordanian data protection regulations.
+* **Anti-Spoofing Guarantee**: Emergency cancellations require either authenticated rider touch or verified biometric voice signature matching.

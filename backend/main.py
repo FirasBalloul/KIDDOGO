@@ -15,6 +15,7 @@ import models
 from database import engine, get_db
 from voice_verifier import enroll_child_voice, verify_speaker, CHILD_VOICE_REGISTRY, PROFILES_DIR
 from fusion_engine import fusion_engine
+from whatsapp_notifier import send_whatsapp_alert_async
 
 from google import genai
 from google.genai import types
@@ -142,7 +143,9 @@ async def handle_spatial_breach(payload: SpatialBreachPayload, db: Session = Dep
         sound_type=fusion_result["classification"],
         confidence=fusion_result["fused_score"],
         latitude=current_lat,
-        longitude=current_lon
+        longitude=current_lon,
+        status=fusion_result["status"],
+        details=f"{fusion_result['summary']} ({limb_name})"
     )
     db.add(db_alert)
     db.commit()
@@ -160,11 +163,22 @@ async def handle_spatial_breach(payload: SpatialBreachPayload, db: Session = Dep
         "details": f"{fusion_result['summary']} ({limb_name})"
     })
 
+    # Dispatch 911/Ops WhatsApp emergency alert
+    await send_whatsapp_alert_async(
+        incident_type=f"Cabin Spatial Breach ({limb_name})",
+        confidence=fusion_result["fused_score"],
+        latitude=current_lat,
+        longitude=current_lon,
+        status=fusion_result["status"],
+        details=f"Target Zone: {payload.zone} | Limb: {limb_name} | {fusion_result['summary']}"
+    )
+
     return {
         "status": "ACKNOWLEDGED",
         "location": {"lat": current_lat, "lon": current_lon},
         "fusion": fusion_result
     }
+
 
 # Mount the incident router
 app.include_router(router)
@@ -216,6 +230,14 @@ async def update_live_location(telemetry: LocationTelemetry, db: Session = Depen
             "timestamp": "Just now",
             "details": f"Vehicle is {corridor_eval['corridor_distance_meters']}m away from the authorized route corridor."
         })
+        await send_whatsapp_alert_async(
+            incident_type="Route Corridor Deviation Anomaly",
+            confidence=0.88,
+            latitude=telemetry.latitude,
+            longitude=telemetry.longitude,
+            status="INCIDENT_FLAGGED",
+            details=f"Vehicle is {corridor_eval['corridor_distance_meters']}m away from the authorized route corridor."
+        )
 
     if corridor_eval.get("is_unexpected_stop"):
         await manager.broadcast({
@@ -228,6 +250,14 @@ async def update_live_location(telemetry: LocationTelemetry, db: Session = Depen
             "timestamp": "Just now",
             "details": f"Vehicle has been stationary for {corridor_eval['stationary_duration_sec']}s in an unapproved zone."
         })
+        await send_whatsapp_alert_async(
+            incident_type="Prolonged Unplanned Stationary Anomaly",
+            confidence=0.90,
+            latitude=telemetry.latitude,
+            longitude=telemetry.longitude,
+            status="INCIDENT_FLAGGED",
+            details=f"Vehicle has been stationary for {corridor_eval['stationary_duration_sec']}s in an unapproved zone."
+        )
 
     await manager.broadcast({
         "type": "LOCATION_TELEMETRY",
@@ -254,17 +284,31 @@ async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
     alert_lat = alert.latitude if alert.latitude is not None else latest_vehicle_telemetry["latitude"]
     alert_lon = alert.longitude if alert.longitude is not None else latest_vehicle_telemetry["longitude"]
 
+    # Check for manual SOS button or high-confidence distress
+    is_manual_sos = (
+        (alert.status and "SOS" in alert.status.upper()) or 
+        ("SOS" in alert.sound_type.upper()) or
+        (alert.status == "MANUAL_SOS_TRIGGERED")
+    )
+    is_impostor = (alert.status == "IMPOSTOR_BLOCKED")
+
     # Feed acoustic event into fusion engine
     fusion_result = fusion_engine.record_audio_event(
         sound_type=alert.sound_type,
         confidence=alert.confidence
     )
 
+    alert_status = "MANUAL_SOS_TRIGGERED" if is_manual_sos else ("IMPOSTOR_BLOCKED" if is_impostor else fusion_result["status"])
+    alert_details = "In-cabin SOS button pressed by passenger." if is_manual_sos else fusion_result["summary"]
+    alert_confidence = 1.0 if is_manual_sos else (fusion_result["fused_score"] if fusion_result.get("fused_score") else alert.confidence)
+
     db_alert = models.Alert(
         sound_type=alert.sound_type,
-        confidence=alert.confidence,
+        confidence=alert_confidence,
         latitude=alert_lat,
-        longitude=alert_lon
+        longitude=alert_lon,
+        status=alert_status,
+        details=alert_details
     )
     db.add(db_alert)
     db.commit()
@@ -273,19 +317,70 @@ async def receive_alert(alert: DistressAlert, db: Session = Depends(get_db)):
     # Broadcast correlated alert
     await manager.broadcast({
         "type": "INCIDENT_ALERT",
-        "sound_type": f"{alert.sound_type} ({fusion_result['classification']})",
-        "confidence": fusion_result["fused_score"],
+        "sound_type": f"{alert.sound_type} ({fusion_result['classification']})" if not is_manual_sos else alert.sound_type,
+        "confidence": alert_confidence,
         "latitude": alert_lat,
         "longitude": alert_lon,
-        "status": fusion_result["status"],
-        "timestamp": str(db_alert.timestamp),
-        "details": fusion_result["summary"]
+        "status": alert_status,
+        "timestamp": db_alert.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ") if db_alert.timestamp else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "details": alert_details
     })
+
+    is_high_distress = (
+        fusion_result.get("fused_score", 0.0) >= 0.50 or 
+        fusion_result.get("status") in ("CONFIRMED_DISTRESS", "HIGH_SEVERITY", "POSSIBLE_DISTRESS") or
+        any(k in alert.sound_type.lower() for k in ["glass", "impact", "scream", "shout", "distress", "crash"])
+    )
+
+    if is_manual_sos:
+        await send_whatsapp_alert_async(
+            incident_type="EMERGENCY SOS BUTTON ACTIVATED BY PASSENGER",
+            confidence=1.0,
+            latitude=alert_lat,
+            longitude=alert_lon,
+            status="MANUAL_SOS_TRIGGERED",
+            details="The child passenger pressed the emergency SOS button on the in-cabin tablet."
+        )
+    elif is_impostor:
+        await send_whatsapp_alert_async(
+            incident_type="SECURITY OVERRIDE DETECTED: Impostor Voice Blocked",
+            confidence=1.0,
+            latitude=alert_lat,
+            longitude=alert_lon,
+            status="IMPOSTOR_BLOCKED",
+            details="Captain or unauthorized speaker attempted to dismiss passenger distress confirmation."
+        )
+    elif is_high_distress:
+        await send_whatsapp_alert_async(
+            incident_type=f"In-Cabin Acoustic Distress ({alert.sound_type})",
+            confidence=alert_confidence,
+            latitude=alert_lat,
+            longitude=alert_lon,
+            status=alert_status,
+            details=f"Acoustic safety sensor detected potential cabin distress: {alert_details}"
+        )
+
     return {"status": "DISPATCHED", "fusion": fusion_result, "pinned_at": [alert_lat, alert_lon]}
+
 
 @app.get("/api/alerts")
 def get_all_alerts(db: Session = Depends(get_db)):
-    return db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(30).all()
+    alerts = db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(30).all()
+    return [
+        {
+            "id": a.id,
+            "sound_type": a.sound_type,
+            "confidence": a.confidence,
+            "latitude": a.latitude,
+            "longitude": a.longitude,
+            "status": a.status or ("MANUAL_SOS_TRIGGERED" if ("SOS" in a.sound_type.upper() or "MANUAL" in a.sound_type.upper()) else "INCIDENT_FLAGGED"),
+            "details": a.details or "Cabin status verified by PetraRide KIDDOGO engine.",
+            "timestamp": a.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ") if a.timestamp else None
+        }
+        for a in alerts
+    ]
+
+
 
 @app.get("/api/voice/status/{child_id}")
 def get_voice_status(child_id: str):
@@ -317,6 +412,14 @@ async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get
             "timestamp": "Just now",
             "details": "Captain or third-party voice detected during child check-in confirmation."
         })
+        await send_whatsapp_alert_async(
+            incident_type="Unauthorized Voice Intervention (Impostor Blocked)",
+            confidence=0.99,
+            latitude=current_lat,
+            longitude=current_lon,
+            status="IMPOSTOR_BLOCKED",
+            details="Captain or unauthorized third-party speaker attempted to override passenger safety check-in."
+        )
         return {
             **verification_result,
             "triage": {
@@ -374,7 +477,18 @@ async def verify_voice_endpoint(payload: VoicePayload, db: Session = Depends(get
         "details": triage_data["log_summary"]
     })
 
+    if triage_data.get("is_emergency"):
+        await send_whatsapp_alert_async(
+            incident_type=f"Voice Safety Distress: {triage_data['detected_situation']}",
+            confidence=triage_data.get("confidence", 0.95),
+            latitude=current_lat,
+            longitude=current_lon,
+            status="CRITICAL_ESCALATION",
+            details=triage_data["log_summary"]
+        )
+
     return {**verification_result, "triage": triage_data}
+
 
 @app.post("/api/companion/chat")
 async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = Depends(get_db)):
@@ -442,11 +556,14 @@ async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = D
         }
 
     if chat_eval["is_distress"]:
+        alert_details = f'Child: "{payload.message}" | Category: {chat_eval.get("distress_category", "Distress")}'
         db_alert = models.Alert(
             sound_type=f"PASSENGER CHAT: {chat_eval.get('distress_category', 'Distress')}",
             confidence=0.95,
             latitude=current_lat,
-            longitude=current_lon
+            longitude=current_lon,
+            status="CRITICAL_ESCALATION",
+            details=alert_details
         )
         db.add(db_alert)
         db.commit()
@@ -459,8 +576,17 @@ async def companion_chat_endpoint(payload: CompanionChatPayload, db: Session = D
             "longitude": current_lon,
             "status": "CRITICAL_ESCALATION",
             "timestamp": "Just now",
-            "details": f'Child: "{payload.message}" | Category: {chat_eval.get("distress_category", "Distress")}'
+            "details": alert_details
         })
+
+        await send_whatsapp_alert_async(
+            incident_type="Passenger Text Distress Flag",
+            confidence=0.95,
+            latitude=current_lat,
+            longitude=current_lon,
+            status="CRITICAL_ESCALATION",
+            details=alert_details
+        )
 
     return chat_eval
 
@@ -506,11 +632,14 @@ async def companion_voice_chat_endpoint(payload: VoiceChatPayload, db: Session =
         }
 
     if chat_eval.get("is_distress"):
+        voice_details = f'Child Spoke: "{chat_eval.get("transcription", "")}" | Category: {chat_eval.get("distress_category", "Distress")}'
         db_alert = models.Alert(
             sound_type=f"VOICE CHAT: {chat_eval.get('distress_category', 'Distress')}",
             confidence=0.95,
             latitude=current_lat,
-            longitude=current_lon
+            longitude=current_lon,
+            status="CRITICAL_ESCALATION",
+            details=voice_details
         )
         db.add(db_alert)
         db.commit()
@@ -523,10 +652,50 @@ async def companion_voice_chat_endpoint(payload: VoiceChatPayload, db: Session =
             "longitude": current_lon,
             "status": "CRITICAL_ESCALATION",
             "timestamp": "Just now",
-            "details": f'Child Spoke: "{chat_eval.get("transcription", "")}" | Category: {chat_eval.get("distress_category", "Distress")}'
+            "details": voice_details
         })
 
+
+        await send_whatsapp_alert_async(
+            incident_type="Passenger Voice Distress Flag",
+            confidence=0.95,
+            latitude=current_lat,
+            longitude=current_lon,
+            status="CRITICAL_ESCALATION",
+            details=f'Spoken: "{chat_eval.get("transcription", "")}" | Category: {chat_eval.get("distress_category", "Distress")}'
+        )
+
     return chat_eval
+
+class WhatsAppTestPayload(BaseModel):
+    phone: Optional[str] = None
+    custom_message: Optional[str] = None
+
+@app.post("/api/whatsapp/test-alert")
+async def trigger_whatsapp_test_alert(payload: Optional[WhatsAppTestPayload] = None):
+    """Explicit endpoint to test 911 / WhatsApp dispatch to your phone."""
+    global latest_vehicle_telemetry
+    target_phone = payload.phone if payload and payload.phone else None
+    
+    current_lat = latest_vehicle_telemetry["latitude"]
+    current_lon = latest_vehicle_telemetry["longitude"]
+    
+    if payload and payload.custom_message:
+        from whatsapp_notifier import send_whatsapp_message_sync
+        res = send_whatsapp_message_sync(payload.custom_message, phone=target_phone)
+    else:
+        res = await send_whatsapp_alert_async(
+            incident_type="911 / Central Operations System Test Alert",
+            confidence=0.99,
+            latitude=current_lat,
+            longitude=current_lon,
+            status="SIMULATED_EMERGENCY",
+            details="Manual emergency dispatch test verification triggered from GuardianRide console.",
+            phone=target_phone
+        )
+    return {"status": "DISPATCH_TRIGGERED", "details": res}
+
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -1223,20 +1392,63 @@ def render_map():
             }
 
             function onIncident(alert, fly = false) {
-                const isBreach = alert.status === "IMPOSTOR_BLOCKED" || 
-                                 alert.status === "CRITICAL_ESCALATION" || 
-                                 alert.status === "MANUAL_SOS_TRIGGERED" ||
-                                 alert.status === "DISTRESS_DETECTED" ||
-                                 alert.status === "ESCALATED" ||
-                                 alert.status === "INCIDENT_FLAGGED" ||
-                                 (alert.sound_type && (
-                                     alert.sound_type.toLowerCase().includes("scream") || 
-                                     alert.sound_type.toLowerCase().includes("distress") || 
-                                     alert.sound_type.toLowerCase().includes("crash") ||
-                                     alert.sound_type.toLowerCase().includes("unauthorized") ||
-                                     alert.sound_type.toLowerCase().includes("spatial") ||
-                                     alert.sound_type.toLowerCase().includes("replay")
-                                 ));
+                const soundLower = (alert.sound_type || "").toLowerCase();
+                const statusUpper = (alert.status || "").toUpperCase();
+
+                const isExplicitlySafe = statusUpper === "VERIFIED_SAFE" || 
+                                         statusUpper === "SAFE" || 
+                                         soundLower.includes("confirmed safe") ||
+                                         soundLower.includes("passenger confirmed safety");
+
+                const isBreach = !isExplicitlySafe && (
+                    statusUpper === "IMPOSTOR_BLOCKED" || 
+                    statusUpper === "CRITICAL_ESCALATION" || 
+                    statusUpper === "MANUAL_SOS_TRIGGERED" ||
+                    statusUpper === "MANUAL_SOS" ||
+                    statusUpper === "DISTRESS_DETECTED" ||
+                    statusUpper === "ESCALATED" ||
+                    statusUpper === "INCIDENT_FLAGGED" ||
+                    statusUpper === "CONFIRMED_DISTRESS" ||
+                    statusUpper === "HIGH_SEVERITY" ||
+                    statusUpper === "POSSIBLE_DISTRESS" ||
+                    statusUpper === "BOUNDARY_BREACH" ||
+                    soundLower.includes("sos") ||
+                    soundLower.includes("manual") ||
+                    soundLower.includes("glass") ||
+                    soundLower.includes("impact") ||
+                    soundLower.includes("crash") ||
+                    soundLower.includes("scream") ||
+                    soundLower.includes("shout") ||
+                    soundLower.includes("yell") ||
+                    soundLower.includes("cry") ||
+                    soundLower.includes("distress") ||
+                    soundLower.includes("unauthorized") ||
+                    soundLower.includes("spatial") ||
+                    soundLower.includes("breach") ||
+                    soundLower.includes("deviation") ||
+                    soundLower.includes("stationary") ||
+                    soundLower.includes("impostor") ||
+                    soundLower.includes("fear") ||
+                    soundLower.includes("concern") ||
+                    soundLower.includes("passenger chat") ||
+                    soundLower.includes("voice chat") ||
+                    soundLower.includes("replay")
+                );
+
+                let badgeText = "PASSENGER SAFE";
+                if (isBreach) {
+                    if (soundLower.includes("sos") || statusUpper.includes("SOS")) {
+                        badgeText = "EMERGENCY SOS";
+                    } else if (soundLower.includes("unauthorized") || statusUpper === "IMPOSTOR_BLOCKED") {
+                        badgeText = "SECURITY OVERRIDE";
+                    } else if (soundLower.includes("deviation") || soundLower.includes("stationary")) {
+                        badgeText = "ROUTE ANOMALY";
+                    } else if (soundLower.includes("chat") || soundLower.includes("voice")) {
+                        badgeText = "PASSENGER CONCERN";
+                    } else {
+                        badgeText = "PRIORITY DISPATCH";
+                    }
+                }
 
                 if (isBreach) breachCount++;
                 alertCount++;
@@ -1253,7 +1465,14 @@ def render_map():
                 let readableTime = "Just now";
                 if (alert.timestamp && alert.timestamp !== "Just now") {
                     try {
-                        const parsedDate = new Date(alert.timestamp);
+                        let ts = String(alert.timestamp).trim();
+                        // If it's a raw UTC datetime string from DB without Z or offset (e.g. "2026-10-09 11:20:36")
+                        if (!ts.includes('Z') && !ts.includes('+') && ts.includes(' ')) {
+                            ts = ts.replace(' ', 'T') + 'Z';
+                        } else if (!ts.includes('Z') && !ts.includes('+') && ts.includes('T')) {
+                            ts = ts + 'Z';
+                        }
+                        const parsedDate = new Date(ts);
                         if (!isNaN(parsedDate.getTime())) {
                             readableTime = parsedDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                         } else {
@@ -1272,7 +1491,7 @@ def render_map():
                     <div class="card-top">
                         <div class="card-title">${alert.sound_type}</div>
                         <span class="badge ${isBreach ? 'badge-breach' : 'badge-safe'}">
-                            ${isBreach ? 'PRIORITY DISPATCH' : 'PASSENGER SAFE'}
+                            ${badgeText}
                         </span>
                     </div>
                     <div class="card-body">
@@ -1297,12 +1516,55 @@ def render_map():
                         fillOpacity: 0.95
                     }).addTo(map);
 
-                    marker.bindPopup(`<b>${alert.sound_type}</b><br>${isBreach ? 'PRIORITY DISPATCH' : 'PASSENGER SAFE'}`);
+                    marker.bindPopup(`<b>${alert.sound_type}</b><br>${badgeText}`);
                     if (fly) marker.openPopup();
                 }
 
                 feed.prepend(card);
             }
+
+            let audioCtx = null;
+            function playEmergencyChime(isSos = false) {
+                try {
+                    if (!audioCtx) {
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    if (audioCtx.state === 'suspended') {
+                        audioCtx.resume();
+                    }
+                    const now = audioCtx.currentTime;
+                    const osc = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+
+                    osc.type = isSos ? 'triangle' : 'sine';
+                    if (isSos) {
+                        osc.frequency.setValueAtTime(950, now);
+                        osc.frequency.exponentialRampToValueAtTime(1300, now + 0.15);
+                        osc.frequency.exponentialRampToValueAtTime(950, now + 0.30);
+                        osc.frequency.exponentialRampToValueAtTime(1300, now + 0.45);
+                    } else {
+                        osc.frequency.setValueAtTime(880, now);
+                        osc.frequency.exponentialRampToValueAtTime(587, now + 0.25);
+                    }
+
+                    gain.gain.setValueAtTime(0.25, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + (isSos ? 0.6 : 0.4));
+
+                    osc.connect(gain);
+                    gain.connect(audioCtx.destination);
+
+                    osc.start(now);
+                    osc.stop(now + (isSos ? 0.6 : 0.4));
+                } catch (err) {
+                    // Browsers require user interaction before first audio playback
+                }
+            }
+
+            // User gesture unlock for audio
+            document.addEventListener('click', () => {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+            }, { once: true });
 
             fetch('/api/alerts')
                 .then(r => r.json())
@@ -1321,6 +1583,9 @@ def render_map():
                 if (packet.type === "LOCATION_TELEMETRY") {
                     onLocation(packet);
                 } else {
+                    const soundLower = (packet.sound_type || "").toLowerCase();
+                    const isSos = soundLower.includes("sos") || (packet.status && packet.status.includes("SOS"));
+                    playEmergencyChime(isSos);
                     onIncident(packet, true);
                 }
             };
@@ -1331,6 +1596,7 @@ def render_map():
                 document.getElementById('conn-status').innerText = "Offline";
             };
         </script>
+
     </body>
     </html>
     """

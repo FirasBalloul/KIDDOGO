@@ -11,7 +11,9 @@ import {
   Vibration,
   Modal,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
+
 import { WebView } from 'react-native-webview';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { useAudioRecorder } from '@siteed/audio-studio';
@@ -22,6 +24,7 @@ import { CompanionChatModal } from '../components/CompanionChatModal';
 
 const { width } = Dimensions.get('window');
 const BACKEND_URL = 'http://192.168.1.29:8000';
+
 
 const DISTRESS_CONFIDENCE_THRESHOLD = 0.20;
 
@@ -173,6 +176,44 @@ export default function GuardianAITester() {
   const [pendingAlert, setPendingAlert] = useState<{ soundName: string; confidence: number; index: number } | null>(null);
   const [isVerifyingVoice, setIsVerifyingVoice] = useState(false);
 
+  // Dedicated Main SOS Countdown States
+  const [sosCountdown, setSosCountdown] = useState<number | null>(null);
+  const sosCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const startSosCountdown = (reason: string = 'MANUAL PASSENGER SOS BUTTON ACTIVATED') => {
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    setShowVerificationModal(false);
+    showVerificationModalRef.current = false;
+
+    Vibration.vibrate([0, 250, 150, 250]);
+    setSosCountdown(3);
+
+    if (sosCountdownTimerRef.current) clearInterval(sosCountdownTimerRef.current);
+    sosCountdownTimerRef.current = setInterval(() => {
+      setSosCountdown((prev) => {
+        if (prev === null || prev <= 1) {
+          if (sosCountdownTimerRef.current) clearInterval(sosCountdownTimerRef.current);
+          dispatchSosImmediately(reason);
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const cancelSosCountdown = () => {
+    if (sosCountdownTimerRef.current) clearInterval(sosCountdownTimerRef.current);
+    setSosCountdown(null);
+    Vibration.cancel();
+  };
+
+  const dispatchSosImmediately = (reason: string = 'MANUAL PASSENGER SOS BUTTON ACTIVATED') => {
+    if (sosCountdownTimerRef.current) clearInterval(sosCountdownTimerRef.current);
+    setSosCountdown(null);
+    Vibration.vibrate([0, 300, 100, 300]);
+    escalateAlertToBrain(reason, 1.0, true, false);
+  };
+
   // Biometric Voice Calibration States
   const [showEnrollModal, setShowEnrollModal] = useState(false);
   const [isEnrolled, setIsEnrolled] = useState(false);
@@ -183,6 +224,7 @@ export default function GuardianAITester() {
   const webViewRef = useRef<WebView>(null);
   const isSpeakingRef = useRef(false);
   const showVerificationModalRef = useRef(false);
+
 
   // Cooldown & echo suppression refs
   const lastAlertTime = useRef<number>(0);
@@ -424,21 +466,18 @@ export default function GuardianAITester() {
     const currentLon = coordsRef.current.longitude;
 
     try {
-      await fetch(`${BACKEND_URL}/api/alerts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sound_type: soundName,
-          confidence: parseFloat(confidence.toFixed(2)),
-          latitude: currentLat,
-          longitude: currentLon,
-          status: impostor ? 'IMPOSTOR_BLOCKED' : manual ? 'MANUAL_SOS_TRIGGERED' : 'CRITICAL_ESCALATION',
-        }),
+      await safePost(`${BACKEND_URL}/api/alerts`, {
+        sound_type: soundName,
+        confidence: parseFloat(confidence.toFixed(2)),
+        latitude: currentLat,
+        longitude: currentLon,
+        status: impostor ? 'IMPOSTOR_BLOCKED' : manual ? 'MANUAL_SOS_TRIGGERED' : 'CRITICAL_ESCALATION',
       });
     } catch (err) {
       console.error('Dispatch failed:', err);
     }
   };
+
 
   // Biometric Voice Verification and LLM Triage
   const verifyAndConfirmSafe = async () => {
@@ -818,7 +857,7 @@ export default function GuardianAITester() {
             </View>
             <View style={{ flexShrink: 1 }}>
               <Text style={styles.brandTitle} numberOfLines={1}>
-                PetraRide <Text style={styles.brandAccent}>KIDDOGO</Text>
+                 KIDDO<Text style={styles.brandAccent}>GO</Text>
               </Text>
               <Text style={styles.brandSubtitle} numberOfLines={1}>COCKPIT • TRIP PR-9942</Text>
             </View>
@@ -842,8 +881,18 @@ export default function GuardianAITester() {
             >
               <Text style={styles.chatLaunchPillText}>💬 BUDDY</Text>
             </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.headerSosPill}
+              onPress={() => startSosCountdown('MANUAL PASSENGER SOS BUTTON ACTIVATED')}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.headerSosPillText}>🚨 SOS</Text>
+            </TouchableOpacity>
           </View>
         </View>
+
+
 
         {/* Biometric Shield Interactive Status Strip */}
         <TouchableOpacity
@@ -985,9 +1034,7 @@ export default function GuardianAITester() {
                 <TouchableOpacity
                   style={styles.sosInstantBtn}
                   onPress={() => {
-                    if (pendingAlert) {
-                      escalateAlertToBrain(pendingAlert.soundName, pendingAlert.confidence, true);
-                    }
+                    startSosCountdown(pendingAlert?.soundName || 'MANUAL PASSENGER SOS BUTTON ACTIVATED');
                   }}
                   activeOpacity={0.85}
                 >
@@ -996,6 +1043,7 @@ export default function GuardianAITester() {
                   </Text>
                 </TouchableOpacity>
               </View>
+
             )}
           </View>
         )}
@@ -1101,11 +1149,64 @@ export default function GuardianAITester() {
           escalateAlertToBrain('MANUAL CHILD COMPANION SOS', 1.0, true, false);
         }}
       />
+
+      {/* 9. Interactive Main SOS Countdown Modal */}
+      <Modal visible={sosCountdown !== null} transparent animationType="fade">
+        <View style={styles.sosModalOverlay}>
+          <View style={styles.sosModalCard}>
+            <View style={styles.sosModalHeaderRow}>
+              <View style={styles.sosBadgeDot} />
+              <Text style={styles.sosModalHeader}>
+                {companionLang === 'ar' ? 'تنبيه طوارئ 911 عاجل' : 'EMERGENCY 911 DISPATCH'}
+              </Text>
+            </View>
+
+            <Text style={styles.sosModalTitle}>
+              {companionLang === 'ar'
+                ? 'جاري إرسال نداء الاستغاثة لغرفة العمليات وخدمة 911...'
+                : 'Alerting Operations & 911 Emergency Services...'}
+            </Text>
+
+            <View style={styles.sosCountdownCircle}>
+              <Text style={styles.sosCountdownNumber}>{sosCountdown}s</Text>
+            </View>
+
+            <Text style={styles.sosModalSub}>
+              {companionLang === 'ar'
+                ? 'سيتم إرسال موقعك الفوري وتنبيه السائق والجهات الأمنية فور انتهاء العداد.'
+                : 'Your live GPS coordinates will be dispatched automatically when the countdown ends.'}
+            </Text>
+
+            <View style={styles.sosModalActionRow}>
+              <TouchableOpacity
+                style={styles.sosCancelBtn}
+                onPress={cancelSosCountdown}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.sosCancelBtnText}>
+                  {companionLang === 'ar' ? 'إلغاء (أنا بأمان)' : "CANCEL (I'M SAFE)"}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.sosInstantDispatchBtn}
+                onPress={() => dispatchSosImmediately('MANUAL PASSENGER SOS BUTTON ACTIVATED')}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.sosInstantDispatchBtnText}>
+                  {companionLang === 'ar' ? 'إرسال فوراً' : 'SEND NOW'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+
   container: { flex: 1, backgroundColor: '#07090E' },
   header: {
     paddingHorizontal: 16,
@@ -1173,6 +1274,26 @@ const styles = StyleSheet.create({
     fontSize: 9.5,
     fontWeight: '800',
   },
+  headerSosPill: {
+    backgroundColor: '#EF4444',
+    borderWidth: 1,
+    borderColor: '#DC2626',
+    paddingHorizontal: 10,
+    paddingVertical: 5.5,
+    borderRadius: 8,
+    shadowColor: '#EF4444',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  headerSosPillText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+
 
   shieldBannerBtn: {
     flexDirection: 'row',
@@ -1413,5 +1534,109 @@ const styles = StyleSheet.create({
     color: '#FCA5A5',
     fontSize: 10.5,
     fontWeight: '700',
+  },
+
+  // SOS Countdown Modal Styles
+  sosModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.88)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  sosModalCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#0E131F',
+    borderRadius: 22,
+    borderWidth: 2,
+    borderColor: '#EF4444',
+    padding: 22,
+    alignItems: 'center',
+    shadowColor: '#EF4444',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  sosModalHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+  },
+  sosBadgeDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#EF4444',
+  },
+  sosModalHeader: {
+    color: '#EF4444',
+    fontSize: 12,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  sosModalTitle: {
+    color: '#FFFFFF',
+    fontSize: 15.5,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginBottom: 14,
+    lineHeight: 22,
+  },
+  sosCountdownCircle: {
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    borderWidth: 2.5,
+    borderColor: '#EF4444',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  sosCountdownNumber: {
+    color: '#EF4444',
+    fontSize: 28,
+    fontWeight: '900',
+  },
+  sosModalSub: {
+    color: '#94A3B8',
+    fontSize: 11.5,
+    textAlign: 'center',
+    lineHeight: 17,
+    marginBottom: 20,
+  },
+  sosModalActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+    width: '100%',
+  },
+  sosCancelBtn: {
+    flex: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  sosCancelBtnText: {
+    color: '#FFFFFF',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  sosInstantDispatchBtn: {
+    flex: 1,
+    backgroundColor: '#EF4444',
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  sosInstantDispatchBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '900',
   },
 });
